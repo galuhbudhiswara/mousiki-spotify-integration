@@ -3222,14 +3222,44 @@ static std::string colorize_disk_row(const std::string& cells,
     return out;
 }
 
+// Decides whether this frame renders compact, from the real terminal
+// height. Called once per frame before any panel is built.
+//
+// Deliberately height-only, with no host sniffing: a VS Code panel
+// dragged tall deserves the full layout, and a small window in any other
+// terminal has exactly the same problem a VS Code panel does. The two
+// thresholds differ so that dragging a terminal across the boundary
+// settles instead of flickering -- once compact, it takes a clear two
+// extra rows to go back.
+void App::update_compact_mode() {
+    if (settings_.compact_mode == 1) { compact_ = true;  return; }
+    if (settings_.compact_mode == 2) { compact_ = false; return; }
+    if (compact_) {
+        if (term_rows_ >= kCompactLeaveRows) compact_ = false;
+    } else {
+        if (term_rows_ < kCompactEnterRows) compact_ = true;
+    }
+}
+
 std::vector<std::string> App::build_metadata_panel(int total_width) const {
     const int inner = total_width - 4;
-    const int disk_w = settings_.element_disk ? disk_.width() : 0;
-    const int panel_h = disk_.height();
+    // The disk is what makes this panel 15 rows tall, so compact has to
+    // drop it rather than just narrow it -- panel_h is the disk's height
+    // in the full layout, and trimming the text rows alone would change
+    // nothing.
+    const bool show_disk = settings_.element_disk && !compact_;
+    const int disk_w = show_disk ? disk_.width() : 0;
+    const int panel_h = compact_ ? kCompactMetaRows : disk_.height();
     
     std::string sep = "  " + settings_.meta_separator + "  ";
     int sep_w = display_width(sep);
-    const int fixed_extra = settings_.element_disk ? sep_w : 2;
+    // Without the disk there is no ":  :" separator between the metadata
+    // and lyrics columns, and the two columns end up touching -- a long
+    // title runs straight into the lyrics text and reads as one line.
+    // Compact reserves 4: two for the left indent, two for a gutter
+    // between the columns. Taken out of `avail` below so the total width
+    // still adds up.
+    const int fixed_extra = show_disk ? sep_w : (compact_ ? 4 : 2);
 
     int avail = std::max(10, inner - disk_w - fixed_extra);
     int meta_w = avail;
@@ -3241,7 +3271,7 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
     }
 
     std::vector<std::string> disk_frame;
-    if (settings_.element_disk) {
+    if (show_disk) {
         // cell_colors comes back empty unless a cover is actually on the
         // disk, which is what makes the vinyl keep the configured
         // gradient without a second branch down here.
@@ -3290,17 +3320,37 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
             std::string plain = l_pad + ": " + v_tr;
             std::string ansi = k_col + l_pad + "\x1b[0m" + ": " + v_col + v_tr + "\x1b[0m";
             ansi += std::string(std::max(0, meta_w - display_width(plain)), ' ');
-            meta_rows[row] = ansi;
+            // Guarded because panel_h is no longer a constant: compact
+            // shrinks it to kCompactMetaRows, and a row index past the
+            // end would be a buffer overrun rather than a visual bug.
+            if (row >= 0 && row < static_cast<int>(meta_rows.size())) meta_rows[row] = ansi;
         };
-        kv(1, "Name", metadata_.name);
-        kv(2, "Artist", metadata_.artist);
-        kv(3, "year", metadata_.year);
-        kv(4, "sampling", metadata_.sampling);
-        kv(5, "type", metadata_.type);
-        kv(6, "format", metadata_.format);
-        kv(7, "file size", metadata_.file_size);
-        kv(8, "location", metadata_.location);
-        if (!metadata_.extra_label.empty()) kv(9, metadata_.extra_label, metadata_.extra_value);
+        if (compact_) {
+            // Four rows, chosen for what you still want at a glance when
+            // there is no room: what is playing, by whom, off what, and
+            // where the sound is coming out. The dropped rows (sampling,
+            // type, format, file size) describe the file, which is the
+            // least useful thing on screen while something is playing --
+            // and is meaningless outright on the Spotify path, where
+            // mousiki never sees a file.
+            kv(0, "Name", metadata_.name);
+            kv(1, "Artist", metadata_.artist);
+            // Prefer the extra row (album, on the Spotify path) over the
+            // year, which is usually "-" for anything not locally tagged.
+            if (!metadata_.extra_label.empty()) kv(2, metadata_.extra_label, metadata_.extra_value);
+            else                                kv(2, "year", metadata_.year);
+            kv(3, "location", metadata_.location);
+        } else {
+            kv(1, "Name", metadata_.name);
+            kv(2, "Artist", metadata_.artist);
+            kv(3, "year", metadata_.year);
+            kv(4, "sampling", metadata_.sampling);
+            kv(5, "type", metadata_.type);
+            kv(6, "format", metadata_.format);
+            kv(7, "file size", metadata_.file_size);
+            kv(8, "location", metadata_.location);
+            if (!metadata_.extra_label.empty()) kv(9, metadata_.extra_label, metadata_.extra_value);
+        }
 
         // Real spectrum visualizer (KISS FFT), not a copy of the progress
         // bar's RMS envelope. Two rows: bottom row is the base level
@@ -3333,8 +3383,11 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
                 viz_top += tail;
                 viz_bottom += tail;
             }
-            meta_rows[panel_h - 2] = viz_top;
-            meta_rows[panel_h - 1] = viz_bottom;
+            // Compact keeps only the base row: two rows out of five is
+            // too much of the panel, and the upper row only carries the
+            // peaks above level 4.
+            if (!compact_ && panel_h >= 2) meta_rows[panel_h - 2] = viz_top;
+            if (panel_h >= 1) meta_rows[panel_h - 1] = viz_bottom;
             viz_rows_colored = true;
         } else {
             bars = fft_.compute_bars(48, viz_dt_);
@@ -3485,12 +3538,18 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
     std::string sep_ansi = ansi_for(settings_.border_color, false) + sep + "\x1b[0m";
     for (int row = 0; row < panel_h; ++row) {
         std::string content = "";
-        if (settings_.element_disk) {
+        // show_disk, NOT settings_.element_disk: compact leaves the
+        // setting alone and simply doesn't build disk_frame, so keying
+        // this off the setting indexes an empty vector.
+        if (show_disk) {
             content += disk_frame[row] + sep_ansi;
         } else {
             content += "  ";
         }
         content += meta_rows[row];
+        // The gutter reserved by fixed_extra above. Only in compact: the
+        // full layout gets its separation from sep_ansi after the disk.
+        if (compact_ && settings_.element_lyrics && lyrics_w > 0) content += "  ";
         if (settings_.element_lyrics) {
             content += lyric_rows[row];
         }
@@ -3504,7 +3563,10 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
 std::vector<std::string> App::build_progress_panel(int total_width) const {
     const int button_content_w = 9;
     const int button_total_w = button_content_w + 4; // "│ X │"
-    int side_panel_w = settings_.element_dummy_buttons ? (button_total_w * 3) : 38;
+    // The <<< PLAY >>> buttons are decorative and cost three rows of
+    // structure plus a third of the width; compact has neither to spare.
+    const bool show_buttons = settings_.element_dummy_buttons && !compact_;
+    int side_panel_w = show_buttons ? (button_total_w * 3) : 38;
     int main_total_w = std::max(24, total_width - side_panel_w);
     int wave_w = main_total_w - 4;
 
@@ -3585,7 +3647,7 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     std::string play_label = (showing_track() && !paused_now) ? "PAUSE" : "PLAY";
 
     std::vector<std::string> out;
-    if (settings_.element_dummy_buttons) {
+    if (show_buttons) {
         out.push_back(box_top("PROGRESS BAR", main_total_w, border_ansi)
                       + box_top("", button_total_w, border_ansi) + box_top("", button_total_w, border_ansi)
                       + box_top("", button_total_w, border_ansi));
@@ -3596,14 +3658,19 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     std::string row1_content = settings_.element_waveform ? top_wave : generic_blank;
     std::string row2_content = settings_.element_waveform ? mid_wave : generic_bar;
     std::string row3_content = settings_.element_waveform ? bot_wave : generic_blank;
+    // Compact renders the middle row only. It is the one carrying the
+    // played/unplayed colour split, so the bar still reads as a progress
+    // bar with the other two gone.
 
     std::string bar = border_ansi + settings_.box_vertical + "\x1b[0m";
-    if (settings_.element_dummy_buttons) {
+    if (show_buttons) {
         out.push_back(bar + " " + row1_content + " " + bar
                       + button_mid("<<<") + button_mid(play_label) + button_mid(">>>"));
         out.push_back(bar + " " + row2_content + " " + bar
                       + box_bottom(button_total_w, "", border_ansi_bottom) + box_bottom(button_total_w, "", border_ansi_bottom)
                       + box_bottom(button_total_w, "", border_ansi_bottom));
+    } else if (compact_) {
+        out.push_back(bar + " " + row2_content + " " + bar);
     } else {
         out.push_back(bar + " " + row1_content + " " + bar);
         out.push_back(bar + " " + row2_content + " " + bar);
@@ -4628,6 +4695,10 @@ std::string App::render_frame(TerminalIO& term) {
     // truly pathological values feeding into subtraction below.
     term_rows_ = std::max(term.rows(), 4);
 
+    // Height-driven, so a live resize re-lays-out on the next frame.
+    const bool was_compact = compact_;
+    update_compact_mode();
+
     // Browse/BulkAdd/RetryLyrics all share the same live background (the
     // latter two float a small panel on top of it -- see
     // draw_floating_panel()'s comment in app.h), so switching between
@@ -4653,7 +4724,12 @@ std::string App::render_frame(TerminalIO& term) {
         }
         return 0;
     };
-    bool hard_clear = (W != last_render_w_) || (mode_family(mode_) != mode_family(last_render_mode_)) || force_redraw_;
+    // compact_ changing is a height change, not just a content change:
+    // the full layout is 12 rows taller, so going compact leaves rows
+    // below the new frame that nothing would ever overwrite. Same class
+    // of leftover a width change causes.
+    bool hard_clear = (W != last_render_w_) || (mode_family(mode_) != mode_family(last_render_mode_))
+                   || (was_compact != compact_) || force_redraw_;
     if (last_render_w_ != -1 && W != last_render_w_) {
         // Verbose-only: raw ioctl terminal size alongside the clamped
         // app-usable width, i.e. "what the OS actually told us" versus

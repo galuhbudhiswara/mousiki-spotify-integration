@@ -668,6 +668,14 @@ static Settings load_from_config(const fs::path& path) {
         // --- Local music library paths ---
         // --- Spotify integration ---------------------------------------
         if (key == "AutoPlayOnStart" || key == "autoplay_on_start") { s.autoplay_on_start = parse_bool(value); continue; }
+        if (key == "CompactMode" || key == "compact_mode") {
+            std::string v = trim(unquote(value));
+            for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            s.compact_mode = (v == "on" || v == "true" || v == "1") ? 1
+                           : (v == "off" || v == "false" || v == "0") ? 2
+                           : 0; // anything else, including "auto"
+            continue;
+        }
         if (key == "SpotifyEnabled" || key == "spotify_enabled") { s.spotify_enabled = parse_bool(value); continue; }
         if (key == "SpotifyClientId" || key == "spotify_client_id") { s.spotify_client_id = trim(unquote(value)); continue; }
         if (key == "SpotifyForceWebApi" || key == "spotify_force_web_api") { s.spotify_force_web_api = parse_bool(value); continue; }
@@ -946,6 +954,21 @@ void save_settings(const Settings& s) {
     out << "##-------------------------------------------\n";
     out << "##             AUTOSAVE / SESSION SNAPSHOT\n";
     out << "##-------------------------------------------\n\n";
+    out << "CompactMode=" << (s.compact_mode == 1 ? "on" : s.compact_mode == 2 ? "off" : "auto") << "\n";
+    out << "## auto , on , off\n";
+    out << "## A short terminal cannot fit the full layout: the panels above the\n";
+    out << "## track list need 27 rows on their own, 15 of which are the rotating\n";
+    out << "## disk. In a VS Code panel (or any small window) that leaves nothing\n";
+    out << "## for the list at all.\n";
+    out << "##\n";
+    out << "## Compact drops the disk, trims the metadata rows to Name/Artist/\n";
+    out << "## album/device, and collapses the waveform to a single row -- 27 rows\n";
+    out << "## of chrome down to 15, so a 21-row window still shows 5 tracks.\n";
+    out << "##\n";
+    out << "## auto switches on height alone, with no host detection: drag the\n";
+    out << "## terminal taller and the full layout comes back by itself. There is a\n";
+    out << "## deliberate gap between the two thresholds so dragging across the\n";
+    out << "## boundary doesn't flicker between layouts.\n\n";
     out << "AutoPlayOnStart=" << tf(s.autoplay_on_start) << "\n";
     out << "## false = mousiki opens silent and waits for you to pick something.\n";
     out << "##         A restored session still comes back fully loaded -- same\n";

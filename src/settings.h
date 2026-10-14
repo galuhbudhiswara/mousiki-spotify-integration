@@ -171,6 +171,17 @@ struct Settings {
     // loaded -- track, position, queue, lyrics, waveform -- but paused.
     bool autoplay_on_start = false;
 
+    // Compact layout: 0 = auto (switch on terminal height), 1 = always
+    // on, 2 = always off.
+    //
+    // Auto rather than host detection on purpose. The original idea was
+    // to sniff TERM_PROGRAM=vscode, but the thing that actually matters
+    // is how many rows there are -- a VS Code panel dragged tall should
+    // get the full layout, and a 20-row window in any other terminal has
+    // the same problem a VS Code panel does. Height covers both, needs no
+    // per-host special cases, and reacts to a live resize.
+    int compact_mode = 0;
+
     // --- Spotify integration (config.txt: Spotify*) ---------------------
     // Enables the Spotify panel, now-playing and remote control. Off by
     // default: the Web API path needs a one-time sign-in and the local

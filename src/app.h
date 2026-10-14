@@ -156,6 +156,21 @@ private:
     // still can never scroll — the two mechanisms are independent, not
     // "either/or".
     int term_rows_ = 24;
+
+    // --- compact layout -------------------------------------------------
+    // Recomputed every frame from term_rows_ (see update_compact_mode()),
+    // so a live resize switches layouts without a restart.
+    bool compact_ = false;
+    void update_compact_mode();
+    // Metadata panel height when compact: 4 key/value rows plus one
+    // visualizer row. The full layout's height is the disk's instead,
+    // which is why dropping the disk is what actually buys the space.
+    static constexpr int kCompactMetaRows = 5;
+    // Hysteresis. Entering and leaving at the same row count makes the
+    // layout flicker while a terminal is being drag-resized, because the
+    // row count passes through the boundary repeatedly.
+    static constexpr int kCompactEnterRows = 32; // below this -> compact
+    static constexpr int kCompactLeaveRows = 34; // at or above -> full
     int list_visible_rows_ = kListVisibleRows;
     std::string clamp_output_rows(const std::string& frame, int term_rows) const;
 

@@ -1579,13 +1579,6 @@ void App::poll_pending_spotify_status() {
 
     const std::string prev_uri = spotify_status_.track.uri;
 
-    ConsoleLog::instance().log_verbose(
-        "spotify poll: st.uri=" + (st.track.uri.empty() ? std::string("(none)") : st.track.uri.substr(st.track.uri.size()-6)) +
-        " prev=" + (prev_uri.empty() ? std::string("(none)") : prev_uri.substr(prev_uri.size()-6)) +
-        " lyr=" + (spotify_lyrics_uri_.empty() ? std::string("(none)") : spotify_lyrics_uri_.substr(spotify_lyrics_uri_.size()-6)) +
-        " exp=" + (spotify_expected_uri_.empty() ? std::string("(none)") : spotify_expected_uri_.substr(spotify_expected_uri_.size()-6)) +
-        " running=" + (st.is_running ? "1" : "0") + " gen=" + std::to_string(st_gen));
-
     // Waiting on a track we just asked for? Then a reading that still
     // shows something else is Spotify not having switched yet, not the
     // user changing tracks elsewhere. Take the live numbers from it but
@@ -1599,7 +1592,6 @@ void App::poll_pending_spotify_status() {
         spotify_status_.player.is_repeating = st.player.is_repeating;
         if (!st.device.empty()) spotify_status_.device = st.device;
         spotify_queue_ = std::move(up_next);
-        ConsoleLog::instance().log_basic("  [EARLY RETURN] nunggu uri diminta");
         return;
     }
     // Confirmed (or the expectation timed out) -- stop second-guessing
@@ -1650,7 +1642,6 @@ void App::poll_pending_spotify_status() {
         // The uri is "spotify:track:<id>"; the id alone is the cache key.
         set_disk_album_art(spotify_status_.track.art_url,
                            spotify_status_.track.uri.substr(spotify_status_.track.uri.rfind(':') + 1));
-        ConsoleLog::instance().log_basic("  [BRANCH !=] masuk cabang, lyr=" + (spotify_lyrics_uri_.empty()?std::string("(none)"):spotify_lyrics_uri_.substr(spotify_lyrics_uri_.size()-6)) + " st=" + (spotify_status_.track.uri.empty()?std::string("(none)"):spotify_status_.track.uri.substr(spotify_status_.track.uri.size()-6)));
         log_event("spotify: now playing " + spotify_status_.display());
     } else if (spotify_playing_) {
         // Same track: the volume/device/state rows can still have moved.

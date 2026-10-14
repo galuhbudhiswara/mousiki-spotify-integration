@@ -36,7 +36,7 @@ Mousiki is a terminal music player built from the ground up for people who prefe
 
 ## Preview
 
-![Mousiki Preview](./preview.gif?v=2)
+![Mousiki Preview](./preview.gif?v=3)
 
 </div>
 

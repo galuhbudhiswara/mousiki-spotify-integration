@@ -679,6 +679,11 @@ static Settings load_from_config(const fs::path& path) {
         if (key == "SpotifyEnabled" || key == "spotify_enabled") { s.spotify_enabled = parse_bool(value); continue; }
         if (key == "SpotifyClientId" || key == "spotify_client_id") { s.spotify_client_id = trim(unquote(value)); continue; }
         if (key == "SpotifyForceWebApi" || key == "spotify_force_web_api") { s.spotify_force_web_api = parse_bool(value); continue; }
+        if (key == "SpotifyAutoMix" || key == "spotify_auto_mix") { s.spotify_auto_mix = parse_bool(value); continue; }
+        if (key == "SpotifyAutoMixSize" || key == "spotify_auto_mix_size") {
+            try { s.spotify_auto_mix_size = std::clamp(std::stoi(value), 0, 50); } catch (...) {}
+            continue;
+        }
         if (key == "SpotifyPollInterval" || key == "spotify_poll_interval") {
             // Floored at 1000ms: anything faster is pointless for a
             // human-visible now-playing line and just burns rate limit.
@@ -944,6 +949,24 @@ void save_settings(const Settings& s) {
     out << "## backends (MPRIS on Linux, AppleScript on macOS) control the desktop app\n";
     out << "## and can't list playlists. Premium is required for the playback\n";
     out << "## controls; reading state works on a free account.\n\n";
+    out << "SpotifyAutoMix=" << tf(s.spotify_auto_mix) << "\n";
+    out << "## keep playing after the track you picked, by filling the account's\n";
+    out << "## queue behind it.\n";
+    out << "##\n";
+    out << "## This is NOT Spotify's radio. /v1/recommendations -- the endpoint that\n";
+    out << "## seeded a radio from one track -- is closed to apps registered after\n";
+    out << "## 2024-11-27, and there is no replacement. So the queue is filled from\n";
+    out << "## the same pool the home screen's Daily Mix uses: your own top tracks\n";
+    out << "## and recently played. Reliably music you like, but NOT related to the\n";
+    out << "## track you picked -- starting a Radiohead song can be followed by\n";
+    out << "## whatever else you have been listening to.\n";
+    out << "##\n";
+    out << "## Runs on the command worker after playback has already started, so it\n";
+    out << "## never delays the track or blocks the interface.\n\n";
+    out << "SpotifyAutoMixSize=" << s.spotify_auto_mix_size << "\n";
+    out << "## how many tracks to queue up, 0-50. Each one is a separate request\n";
+    out << "## (Spotify's queue endpoint takes one uri at a time), so a large\n";
+    out << "## number means a longer trickle in the background.\n\n";
     out << "SpotifyPollInterval=" << s.spotify_poll_interval_ms << "\n";
     out << "## how often playback state is re-read, in milliseconds. Floored at 1000,\n";
     out << "## and at 5000 for the Web API backend to stay inside Spotify's rate\n";

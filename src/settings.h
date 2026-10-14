@@ -207,6 +207,18 @@ struct Settings {
     // rate limits.
     int spotify_poll_interval_ms = 5000;
 
+    // After starting a track on Spotify, keep the music going by filling
+    // the account's queue behind it.
+    //
+    // This is NOT Spotify's own autoplay/radio: /v1/recommendations, the
+    // endpoint that seeded a radio from a track, is closed to apps
+    // registered after 2024-11-27. The mix is therefore drawn from the
+    // same pool the home screen's Daily Mix uses -- the listener's own
+    // top tracks and recently played -- so it is reliably music they
+    // like, but it is not related to the track they picked.
+    bool spotify_auto_mix = true;
+    int spotify_auto_mix_size = 10;
+
     // --- hotkey mapping ------------------------------------------------
     // Action name → key string (e.g. "ARROW_KEY_UP", "s", "ENTER")
     std::unordered_map<std::string, std::string> hotkeys;

@@ -1322,7 +1322,15 @@ void App::spotify_play_track(const SpotifyTrack& t) {
     auto client = spotify_;
     const std::string uri = t.uri;
     const std::string label = t.search_query();
-    spotify_run_command([this, client, uri, label]() {
+    const bool auto_mix = settings_.spotify_auto_mix && settings_.spotify_auto_mix_size > 0;
+    const int mix_size = settings_.spotify_auto_mix_size;
+    // Seed is the day combined with the track, so starting the same song
+    // twice today continues the same way, while a different song gets a
+    // different continuation. Keyed on the uri rather than a counter so
+    // it survives a restart.
+    const int mix_seed = spotify_daily_seed() ^ static_cast<int>(std::hash<std::string>{}(t.uri));
+
+    spotify_run_command([this, client, uri, label, auto_mix, mix_size, mix_seed]() {
         std::string err, device;
         if (!client->play_uri(uri, &err, &device)) {
             spotify_post_message(err.empty() ? "spotify refused to play that" : err);
@@ -1334,6 +1342,51 @@ void App::spotify_play_track(const SpotifyTrack& t) {
         // "it's playing in the other room" look identical from here.
         spotify_post_message(device.empty() ? "playing on spotify: " + label
                                             : "playing on " + device + ": " + label);
+        if (!auto_mix) return;
+
+        // Everything below runs AFTER playback has started, on the worker
+        // -- the track is already audible, and the queue fills in behind
+        // it. Nothing here can delay the music.
+        //
+        // Not Spotify's radio: /v1/recommendations is closed to apps
+        // registered after 2024-11-27, so there is no "more like this
+        // track" to ask for. This draws from the listener's own history
+        // instead, the same pool the home screen's Daily Mix uses.
+        std::vector<SpotifyTrack> now_favs, all_time, recent;
+        std::string ignored;
+        std::vector<DailyMixSource> sources;
+        if (client->top_tracks("short_term", 50, now_favs, &ignored) && !now_favs.empty())
+            sources.push_back({std::move(now_favs), 5});
+        if (client->top_tracks("long_term", 50, all_time, &ignored) && !all_time.empty())
+            sources.push_back({std::move(all_time), 3});
+        if (client->recently_played(50, recent, &ignored) && !recent.empty())
+            sources.push_back({std::move(recent), 2});
+        if (sources.empty()) return; // nothing to mix from; the track still plays
+
+        // One extra, because the seed track is very likely in the pool
+        // itself (it was probably picked from exactly these lists) and
+        // gets dropped below.
+        std::vector<SpotifyTrack> mix =
+            build_daily_mix(sources, mix_seed, static_cast<std::size_t>(mix_size) + 1);
+
+        int queued = 0;
+        for (const auto& m : mix) {
+            if (queued >= mix_size) break;
+            if (m.uri == uri) continue; // don't queue the track that is playing
+            std::string qerr;
+            if (!client->enqueue(m.uri, &qerr)) {
+                // One failure is the whole queue failing (no active
+                // device, a revoked token), so stop rather than firing
+                // another dozen requests at the same error.
+                spotify_post_message("auto-mix stopped: " + (qerr.empty() ? std::string("queue add refused") : qerr));
+                break;
+            }
+            ++queued;
+        }
+        if (queued > 0) {
+            spotify_post_message("auto-mix: queued " + std::to_string(queued) +
+                                 " more from your listening history");
+        }
     });
 }
 

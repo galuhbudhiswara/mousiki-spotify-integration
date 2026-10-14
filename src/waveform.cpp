@@ -203,11 +203,10 @@ static void stream_decode_ffmpeg_fallback(const fs::path& file_path, StreamingPc
         return;
     }
 
-    // BUG FIX #3: the old design used std::vector<char> leftover with
-    // erase(begin, begin+n) — an O(N) shift called once per read()
-    // chunk across the whole decode. Replaced with a tiny fixed carry
-    // buffer: at most sizeof(float)-1 = 3 bytes can ever be left over
-    // between chunks, so we never need more than 3 bytes of carry state.
+    // A fixed carry buffer rather than a vector with erase(begin, ...),
+    // which would be an O(N) shift once per read() chunk across the
+    // whole decode. At most sizeof(float)-1 = 3 bytes can be left over
+    // between chunks, so 3 bytes of carry state is always enough.
     char carry[sizeof(float) - 1];
     size_t carry_len = 0;
     std::array<char, 65536> buf{};

@@ -45,7 +45,7 @@ void Player::data_callback(ma_device* device, void* output, const void* /*input*
 }
 
 bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volume_pct,
-                   FftVisualizer* fft_sink) {
+                   FftVisualizer* fft_sink, bool start_paused) {
     stop();
     if (!pcm) return false;
 
@@ -61,7 +61,7 @@ bool Player::play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volum
     volume_pct_ = std::clamp(volume_pct, 0, 100);
     gain_.store(volume_pct_ / 100.0f);
     finished_.store(false);
-    paused_.store(false);
+    paused_.store(start_paused);
     cursor_frames_.store(static_cast<long long>(std::max(0.0, start_sec) * sample_rate_));
 
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);

@@ -39,8 +39,14 @@ public:
     // the device down. `fft_sink`, if given, gets push_samples() called
     // from the audio callback with each chunk actually played (nullptr
     // to disable — e.g. not needed for a plain smoke test).
+    // `start_paused` sets the paused flag BEFORE the device is started,
+    // rather than leaving it to a pause() call right after play(). That
+    // window is only milliseconds, but the audio callback is already
+    // running in it, so pausing afterwards emits a short burst of sound
+    // -- audible as a click when restoring a session that is meant to
+    // come up silent.
     bool play(std::shared_ptr<StreamingPcm> pcm, double start_sec, int volume_pct,
-              FftVisualizer* fft_sink = nullptr);
+              FftVisualizer* fft_sink = nullptr, bool start_paused = false);
 
     void pause();
     void resume();

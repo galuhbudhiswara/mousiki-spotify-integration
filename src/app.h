@@ -1,6 +1,9 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,6 +21,8 @@
 #include "player.h"
 #include "settings.h"
 #include "snapshot.h"
+#include "spotify_client.h"
+#include "spotify_home.h"
 #include "sphere_visualizer.h"
 #include "streaming_pcm.h"
 #include "terminal_ui.h"
@@ -28,7 +33,24 @@
 namespace muisc {
 
 enum class Mode { Browse, Search, Settings, ColorEdit, Console, Cheatsheet, BulkAdd, RetryLyrics };
-enum class ListSource { Local, Online };
+enum class ListSource { Local, Online, Spotify };
+
+// Where inside the Spotify view the list panel currently sits. Unlike
+// Local and Online, the Spotify view is a two-deep browser: Home is a
+// menu of sections, and every section resolves to one of the four list
+// shapes below.
+//
+// Each level renders from its own vector (spotify_tracks_,
+// spotify_playlists_, ...) because the columns differ per level -- a
+// track has a duration, a playlist a track count, an album a year.
+enum class SpotifyLevel {
+    Home,       // the section menu
+    Tracks,     // a flat track list -- daily mix, top tracks, liked songs,
+                // search results, a playlist's/album's/artist's tracks
+    Playlists,
+    Artists,
+    Albums,
+};
 
 struct QueueItem {
     bool is_local;
@@ -60,6 +82,40 @@ private:
     std::vector<LocalTrack> all_local_tracks_;
     std::vector<LocalTrack> local_view_;     // filtered
     std::vector<OnlineResult> online_view_;
+
+    // --- Spotify view ---------------------------------------------------
+    // A remote control, not a second decoder -- see the Spotify section
+    // of app.cpp for what follows from that.
+    std::shared_ptr<SpotifyClient> spotify_;
+    // Why the client couldn't be built, shown in the list panel in place
+    // of an empty list: "not signed in" and "no client id in config.txt"
+    // are both fixable, so they have to be visible rather than looking
+    // like an account with no playlists.
+    std::string spotify_unavailable_reason_;
+    SpotifyLevel spotify_level_ = SpotifyLevel::Home;
+    std::vector<SpotifyHomeRow> spotify_home_;
+    std::vector<SpotifyTrack> spotify_tracks_;
+    std::vector<SpotifyPlaylist> spotify_playlists_;
+    std::vector<SpotifyArtist> spotify_artists_;
+    std::vector<SpotifyAlbum> spotify_albums_;
+    // Label for the current Tracks level ("sunday morning", "daily mix
+    // 14 oct", ...) -- the level alone can't name itself, since five
+    // different sections all land on Tracks.
+    std::string spotify_list_label_;
+    // Remembered so Esc from a track list returns to the section the
+    // user drilled in from rather than all the way to Home.
+    SpotifyLevel spotify_parent_level_ = SpotifyLevel::Home;
+    std::string spotify_search_query_;
+    // The account's real up-next list, mirrored from Spotify rather than
+    // owned by mousiki -- see build_queue_panel().
+    std::vector<SpotifyTrack> spotify_queue_;
+    // Level drilled in from, captured when a fetch launches and applied
+    // only once it succeeds, so a failed fetch doesn't rewrite the
+    // back-navigation target.
+    SpotifyLevel spotify_fetch_parent_ = SpotifyLevel::Home;
+    // Search prefix. Not "s:", which belongs to the YouTube search path.
+    static constexpr const char* kSpotifySearchPrefix = "sp:";
+
     int selected_ = 0;
     int scroll_ = 0;
     std::string search_buffer_;
@@ -119,6 +175,21 @@ private:
     bool current_is_local_ = true;  // for snapshot identity -- current_path_ alone is ambiguous
                                      // (online tracks resolve to a cache path too)
     std::string current_video_id_;  // valid when !current_is_local_
+
+    // --- Spotify now-playing -------------------------------------------
+    // While this is true, spotify_status_ is the authority on what's
+    // playing, not `player_`/`metadata_`. Separate from has_track_
+    // because has_track_ gates the finished()/advance machinery in run(),
+    // and advancing past a finished Spotify track is Spotify's job.
+    bool spotify_playing_ = false;
+    SpotifyStatus spotify_status_;
+    // When spotify_status_ was captured. The Web API is polled no more
+    // often than every 5s (rate limits), so position_ms is always stale
+    // by up to that long; spotify_elapsed_sec() interpolates forward
+    // from here instead of letting the progress bar jump.
+    std::chrono::steady_clock::time_point spotify_status_at_;
+    double spotify_elapsed_sec() const;
+
     TrackMetadata metadata_;
     std::vector<float> waveform_envelope_;
     std::chrono::steady_clock::time_point waveform_reveal_start_;
@@ -223,6 +294,9 @@ private:
     // this as its start position instead of 0.0, then zeroes it out so
     // every normal track change afterwards starts at 0 like always.
     double resume_start_sec_ = 0.0;
+    // One-shot, like resume_start_sec_ above: the restored track comes up
+    // paused, everything started afterwards plays normally.
+    bool start_paused_ = false;
     std::chrono::steady_clock::time_point last_autosave_at_;
     // Drives the indicator's brief "something just saved" animation --
     // ticks for kAutosavePulseSeconds after each save, then goes idle.
@@ -355,6 +429,156 @@ private:
     void launch_search_async(const std::string& query);
     void poll_pending_search();
 
+    // --- async Spotify fetch --------------------------------------------
+    // Every Spotify list is at least one network round-trip (playlists
+    // and saved albums are paged until exhausted), so none of it belongs
+    // on the render thread. One thread and one result slot serve every
+    // level: only one list is on screen at a time, so a second fetch
+    // starting means the first one's result is already unwanted.
+    //
+    // The result names the level it is for, so a fetch still in flight
+    // when the user navigates away can't fill the wrong vector.
+    struct SpotifyFetch {
+        bool success = false;
+        std::string error;
+        SpotifyLevel level = SpotifyLevel::Tracks;
+        std::string label;
+        std::vector<SpotifyTrack> tracks;
+        std::vector<SpotifyPlaylist> playlists;
+        std::vector<SpotifyArtist> artists;
+        std::vector<SpotifyAlbum> albums;
+    };
+    std::thread spotify_thread_;
+    std::mutex spotify_mutex_;
+    std::atomic<bool> spotify_fetch_ready_{false};
+    std::atomic<bool> spotify_fetch_in_progress_{false};
+    SpotifyFetch pending_spotify_fetch_;
+    // Runs `work` on the fetch thread and publishes what it fills in, so
+    // the eight sections don't need eight near-identical launchers.
+    void launch_spotify_fetch(std::function<void(SpotifyFetch&)> work);
+    void poll_pending_spotify_fetch();
+
+    // --- Spotify now-playing poll ---------------------------------------
+    // A heartbeat for as long as the Spotify view/playback is active,
+    // sleeping settings_.spotify_poll_interval_ms between reads. Its own
+    // thread because the fetch thread's work is one-shot.
+    std::thread spotify_poll_thread_;
+    std::mutex spotify_status_mutex_;
+    std::atomic<bool> spotify_poll_stop_{false};
+    std::atomic<bool> spotify_poll_running_{false};
+    std::atomic<bool> spotify_status_ready_{false};
+    SpotifyStatus pending_spotify_status_;
+    std::vector<SpotifyTrack> pending_spotify_queue_;
+    // Generation counter for polled state, incremented by every LOCAL
+    // action that changes what should be playing. A status() request
+    // started before such an action describes the world as it was and
+    // must be thrown away -- applying it reports the PREVIOUS track as
+    // newly playing, which flips the metadata panel back and fires a
+    // lyrics fetch for the wrong song. Same guard the codebase already
+    // uses for lyrics (lyrics_epoch_), waveforms (waveform_epoch_) and
+    // audio device handoff (device_gen_).
+    std::atomic<int> spotify_status_gen_{0};
+    // The generation a published-but-not-yet-consumed reading was taken
+    // under. The publish-side check alone leaves a hole: a reading
+    // published microseconds BEFORE a local action is still sitting in
+    // the slot afterwards, and gets consumed as if it were current.
+    int pending_spotify_status_gen_ = 0;
+
+    // The uri we asked Spotify to play, and how long to keep expecting
+    // it. A generation guard alone isn't enough: a poll started AFTER
+    // the command can still read Spotify's state before Spotify has
+    // finished switching tracks, which looks identical to "the user
+    // changed tracks on their phone". While this is set, polled track
+    // identity is ignored (position/volume/device are still taken) until
+    // Spotify confirms this uri. The deadline exists so a play that
+    // never lands can't wedge the UI into ignoring reality forever.
+    // The track whose lyrics are loaded or currently being fetched.
+    //
+    // Both the local play path and the poll path can legitimately decide
+    // "the track changed", and reasoning about which fires first (and
+    // about prev_uri, and about Spotify's own URI relinking, which can
+    // hand back a different uri than the one requested) proved to be a
+    // losing game -- it produced two fetches of the same lyrics, three
+    // provider requests each. Keying the decision on identity instead of
+    // on ordering makes a duplicate structurally impossible: whoever
+    // gets there first records the uri, and nobody refetches it.
+    std::string spotify_lyrics_uri_;
+
+    std::string spotify_expected_uri_;
+    std::chrono::steady_clock::time_point spotify_expected_until_;
+    static constexpr double kSpotifyExpectSeconds = 12.0;
+
+    // --- async Spotify commands ------------------------------------------
+    // Measured on a real account: PUT /me/player/play takes 400-1100ms,
+    // and play_uri() can need three round-trips (play -> 404 -> list
+    // devices -> play with device_id), over two seconds in total. On the
+    // render thread that would freeze the UI for every track change.
+    //
+    // A queue rather than a single slot, because transport keys get
+    // mashed (volume, seek) and dropping presses while one is in flight
+    // feels broken. One long-lived worker drains it in order, so
+    // commands can't race each other either.
+    std::thread spotify_cmd_thread_;
+    std::mutex spotify_cmd_mutex_;
+    std::condition_variable spotify_cmd_cv_;
+    std::deque<std::function<void()>> spotify_cmd_queue_;
+    std::atomic<bool> spotify_cmd_stop_{false};
+    std::atomic<bool> spotify_cmd_started_{false};
+    // Worker -> UI channel. The worker must never touch status_line_ or
+    // log_event() directly; both are read by the render thread.
+    std::mutex spotify_msg_mutex_;
+    std::vector<std::string> spotify_msgs_;
+    void spotify_post_message(const std::string& msg);
+    void poll_pending_spotify_messages();
+    void spotify_run_command(std::function<void()> work);
+    void stop_spotify_cmd_worker();
+
+    void start_spotify_poll();
+    void stop_spotify_poll();
+    void poll_pending_spotify_status();
+
+    // --- Spotify sign-in -------------------------------------------------
+    // SpotifyAuth::interactive_login() blocks on a loopback socket for up
+    // to five minutes waiting for the browser redirect, so it never runs
+    // on the UI thread.
+    std::thread spotify_auth_thread_;
+    std::atomic<bool> spotify_auth_in_progress_{false};
+    std::atomic<bool> spotify_auth_done_{false};
+    std::mutex spotify_auth_mutex_;
+    std::string spotify_auth_error_;
+    bool spotify_auth_success_ = false;
+    void launch_spotify_sign_in();
+    void poll_pending_spotify_auth();
+
+    // --- Spotify actions -------------------------------------------------
+    // Builds the backend if it isn't built yet. False means it can't be
+    // built right now, with spotify_unavailable_reason_ set to why.
+    bool ensure_spotify_client();
+    void enter_spotify();              // the Spotify hotkey
+    void spotify_load_home();          // (re)populate the section menu
+    void spotify_open_section(SpotifyHomeSection section);
+    void spotify_activate_selected();  // Enter
+    void spotify_enqueue_selected();   // the add-to-queue hotkey
+    bool spotify_back();               // Esc -- true when it consumed the key
+    void spotify_play_track(const SpotifyTrack& t);
+    // Mirrors spotify_status_ into metadata_ so the metadata panel needs
+    // no Spotify branch. The file-shaped rows (sampling, format, size)
+    // say there is no file, rather than showing a dash that would read
+    // as "we failed to read it".
+    void apply_spotify_metadata();
+    // True while Spotify, not player_, is the authority on what's
+    // playing. Both panels and the progress bar read through these.
+    bool showing_track() const { return has_track_ || spotify_playing_; }
+    double display_elapsed_sec() const;
+    size_t display_total_sec() const;
+    // Hands playback to Spotify. Only one of the two may play at a time,
+    // and the Spotify path can't pause mousiki's device itself.
+    void yield_playback_to_spotify();
+    void launch_spotify_search(const std::string& query);
+    // Row count of whichever Spotify level is showing.
+    size_t spotify_level_len() const;
+    std::vector<std::string> build_spotify_list_rows(int inner) const;
+
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
     // Rendering uses absolute cursor positioning (\x1b[y;xH) rather than
     // building padded strings line by line -- each field goes exactly
@@ -435,6 +659,10 @@ private:
     // what's actually playing", not "next after wherever you happen to
     // be looking".
     int current_track_list_index() const;
+    // Row count of the list panel's current source, in one place: the
+    // "local_view_ : online_view_" ternary it replaces would have treated
+    // Spotify as Online at all eight of its call sites.
+    size_t current_list_len() const;
     // Pops (or, in Repeat Queue mode, rotates to the back instead of
     // discarding) the next item to play from queue_, honoring the
     // current play_mode: Shuffle picks a random queue item rather than

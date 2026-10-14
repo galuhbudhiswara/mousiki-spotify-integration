@@ -1,4 +1,6 @@
 #include "app.h"
+
+#include "spotify_auth.h"
 #include "console_log.h"
 #include <algorithm>
 #include <chrono>
@@ -513,11 +515,25 @@ void App::update_live_search_preview() {
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
 
-    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
-        list_source_ = pre_search_list_source_;
-        local_view_ = filter_and_rank_local(pre_search_local_query_);
-        selected_ = 0;
-        scroll_ = 0;
+    // Both the YouTube ("s:") and Spotify ("sp:") prefixes mean "this
+    // isn't a local query" -- leave the view as it was rather than
+    // filtering the local library by the literal prefix text.
+    const std::string sp_pfx = kSpotifySearchPrefix;
+    const bool remote_prefix =
+        (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") ||
+        (buf.size() >= sp_pfx.size() && lower(buf.substr(0, sp_pfx.size())) == sp_pfx) ||
+        // While "sp:" is still being typed ("s", "sp") it is already not
+        // a local query -- filtering on the half-typed prefix would make
+        // the list flicker through unrelated matches on every keystroke.
+        (list_source_ == ListSource::Spotify && !buf.empty() && buf.size() <= sp_pfx.size() &&
+         lower(sp_pfx).compare(0, buf.size(), lower(buf)) == 0);
+    if (remote_prefix) {
+        if (list_source_ != ListSource::Spotify) {
+            list_source_ = pre_search_list_source_;
+            local_view_ = filter_and_rank_local(pre_search_local_query_);
+            selected_ = 0;
+            scroll_ = 0;
+        }
         return;
     }
 
@@ -532,6 +548,22 @@ void App::submit_search() {
     // trim
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
+
+    // Checked before the YouTube "s:" prefix purely for readability --
+    // "sp:" can't collide with it anyway ('p' is not ':').
+    {
+        const std::string pfx = kSpotifySearchPrefix;
+        if (buf.size() >= pfx.size() && lower(buf.substr(0, pfx.size())) == pfx) {
+            std::string query = buf.substr(pfx.size());
+            while (!query.empty() && query.front() == ' ') query.erase(query.begin());
+            if (query.empty()) {
+                status_line_ = "type something after /sp: to search spotify";
+                return;
+            }
+            launch_spotify_search(query);
+            return;
+        }
+    }
 
     if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
         std::string query = buf.substr(2);
@@ -721,9 +753,9 @@ void App::poll_pending_load() {
     PendingLoad pl;
     {
         std::lock_guard<std::mutex> lk(load_mutex_);
-        // BUG FIX #4: clear the flag while still holding load_mutex_ so
-        // the load thread cannot race-write pending_load_ again in the
-        // window between the copy and the flag reset.
+        // The flag is cleared while still holding load_mutex_, so the
+        // load thread cannot race-write pending_load_ in the window
+        // between the copy and the reset.
         if (!load_ready_.load()) return; // re-check under lock (spurious wakeup guard)
         pl = pending_load_;
         load_ready_ = false;
@@ -751,7 +783,7 @@ void App::poll_pending_load() {
     waveform_envelope_.clear();
     waveform_ready_ = false;
     waveform_pending_ready_ = false;
-    ++waveform_epoch_; // BUG FIX #5: invalidate any in-flight waveform from the previous track
+    ++waveform_epoch_; // invalidate any in-flight waveform from the previous track
     last_lyrics_status_.clear();
     fft_.reset(); // don't let the previous track's spectrum tail linger into this one's first frame
 
@@ -776,12 +808,12 @@ void App::launch_device_play_async() {
     // play() call safely becomes a no-op-ish teardown once it gets to
     // run, even if a newer one has already taken over by then).
     //
-    // BUG FIX #2: previously the detached old thread could call
-    // ma_device_start() on a device that the new thread had already torn
-    // down inside play() → stop() — undefined behaviour and the root
-    // cause of audio glitches on fast track-switching. The generation
-    // counter lets the old thread detect that it has been superseded and
-    // bail out before it ever touches the device.
+    // Without the generation counter a detached old thread can call
+    // ma_device_start() on a device the new thread already tore down
+    // inside play() → stop() — undefined behaviour, and audible as
+    // glitches on fast track-switching. The counter lets the old thread
+    // notice it has been superseded and bail out before touching the
+    // device.
     if (device_thread_.joinable()) device_thread_.detach();
     int my_gen = ++device_gen_;
     auto pcm = current_pcm_;
@@ -795,10 +827,14 @@ void App::launch_device_play_async() {
     // invariant obvious rather than implicit.
     double start_sec = resume_start_sec_;
     resume_start_sec_ = 0.0;
-    device_thread_ = std::thread([this, pcm, vol, my_gen, start_sec]() {
+    // Same one-shot read-and-clear as start_sec: only the track this
+    // call was launched for comes up paused.
+    bool start_paused = start_paused_;
+    start_paused_ = false;
+    device_thread_ = std::thread([this, pcm, vol, my_gen, start_sec, start_paused]() {
         std::lock_guard<std::mutex> lk(device_mutex_);
         if (my_gen != device_gen_.load()) return; // superseded — a newer play request won
-        player_.play(pcm, start_sec, vol, &fft_);
+        player_.play(pcm, start_sec, vol, &fft_, start_paused);
     });
 }
 
@@ -845,8 +881,891 @@ void App::poll_pending_search() {
     status_line_ = online_view_.empty() ? "no online results" : "";
 }
 
+// =====================================================================
+// Spotify
+//
+// This section drives a remote control. Spotify's audio is DRM'd and
+// mousiki never receives its bytes: choosing a track calls play_uri()
+// and Spotify's own player renders it on whichever device is active.
+// Hence the inert visualizer and waveform while Spotify owns playback --
+// both are fed from Player's audio callback (Player::play's fft_sink),
+// and there is no callback when we aren't decoding. Local playback is
+// untouched.
+// =====================================================================
+
+bool App::ensure_spotify_client() {
+    if (spotify_) return true;
+    spotify_unavailable_reason_.clear();
+
+    if (!settings_.spotify_enabled) {
+        spotify_unavailable_reason_ = "Spotify is off -- set SpotifyEnabled=true in config.txt";
+        return false;
+    }
+    std::string reason;
+    spotify_ = SpotifyClientFactory::get(settings_.spotify_force_web_api,
+                                         settings_.spotify_client_id, &reason);
+    if (!spotify_) {
+        spotify_unavailable_reason_ = reason.empty() ? "Spotify is unavailable" : reason;
+        return false;
+    }
+    // A backend can exist and still be useless for browsing: the local
+    // MPRIS/AppleScript backends control the desktop app, which gives no
+    // view of the account at all. Keep the client (transport control
+    // still works through it) but say so, because an empty home menu
+    // would otherwise read as "your account has nothing in it".
+    if (!spotify_->supports_library()) {
+        spotify_unavailable_reason_ =
+            std::string("the ") + spotify_->backend_name() +
+            " backend can't browse your library -- set SpotifyForceWebApi=true in config.txt";
+    }
+    return true;
+}
+
+void App::enter_spotify() {
+    list_source_ = ListSource::Spotify;
+    spotify_level_ = SpotifyLevel::Home;
+    queue_focus_ = false;
+    selected_ = 0;
+    scroll_ = 0;
+
+    if (!ensure_spotify_client() || !spotify_->supports_library()) {
+        // Leave the menu empty on purpose: build_spotify_list_rows()
+        // renders spotify_unavailable_reason_ in its place, so the
+        // blocker is on screen rather than only in the status line that
+        // clears itself after five seconds.
+        spotify_home_.clear();
+        status_line_ = spotify_unavailable_reason_;
+        log_event("spotify: " + spotify_unavailable_reason_);
+        return;
+    }
+    spotify_load_home();
+    start_spotify_poll();
+    log_event("spotify: home");
+}
+
+void App::spotify_load_home() {
+    spotify_home_ = spotify_home_rows();
+    spotify_list_label_.clear();
+}
+
+size_t App::spotify_level_len() const {
+    switch (spotify_level_) {
+        case SpotifyLevel::Home:      return spotify_home_.size();
+        case SpotifyLevel::Tracks:    return spotify_tracks_.size();
+        case SpotifyLevel::Playlists: return spotify_playlists_.size();
+        case SpotifyLevel::Artists:   return spotify_artists_.size();
+        case SpotifyLevel::Albums:    return spotify_albums_.size();
+    }
+    return 0;
+}
+
+void App::launch_spotify_fetch(std::function<void(SpotifyFetch&)> work) {
+    if (spotify_fetch_in_progress_.load()) {
+        status_line_ = "still loading from spotify ...";
+        return;
+    }
+    if (spotify_thread_.joinable()) spotify_thread_.join();
+    spotify_fetch_parent_ = spotify_level_; // applied only on success, see poll
+    spotify_fetch_in_progress_ = true;
+    spotify_fetch_ready_ = false;
+
+    spotify_thread_ = std::thread([this, work = std::move(work)]() {
+        SpotifyFetch f;
+        work(f);
+        std::lock_guard<std::mutex> lk(spotify_mutex_);
+        pending_spotify_fetch_ = std::move(f);
+        spotify_fetch_ready_ = true;
+    });
+}
+
+void App::poll_pending_spotify_fetch() {
+    if (!spotify_fetch_ready_.load()) return;
+    SpotifyFetch f;
+    {
+        std::lock_guard<std::mutex> lk(spotify_mutex_);
+        f = std::move(pending_spotify_fetch_);
+        spotify_fetch_ready_ = false;
+    }
+    spotify_fetch_in_progress_ = false;
+
+    if (!f.success) {
+        status_line_ = f.error.empty() ? "spotify request failed" : f.error;
+        log_event("spotify: " + status_line_);
+        return; // stay exactly where we were -- a failed drill-in is a no-op
+    }
+
+    // Only the arriving level's vector is replaced. Overwriting all four
+    // would wipe the parent level's rows, and Esc back out of a track
+    // list would land on an empty playlist chooser.
+    switch (f.level) {
+        case SpotifyLevel::Tracks:    spotify_tracks_    = std::move(f.tracks);    break;
+        case SpotifyLevel::Playlists: spotify_playlists_ = std::move(f.playlists); break;
+        case SpotifyLevel::Artists:   spotify_artists_   = std::move(f.artists);   break;
+        case SpotifyLevel::Albums:    spotify_albums_    = std::move(f.albums);    break;
+        case SpotifyLevel::Home:      break;
+    }
+    spotify_parent_level_ = spotify_fetch_parent_;
+    spotify_level_ = f.level;
+    spotify_list_label_ = f.label;
+    selected_ = 0;
+    scroll_ = 0;
+    status_line_ = spotify_level_len() == 0 ? "nothing here" : "";
+}
+
+void App::spotify_open_section(SpotifyHomeSection section) {
+    if (!ensure_spotify_client()) { status_line_ = spotify_unavailable_reason_; return; }
+    // Captured by value: the worker thread must not read spotify_, which
+    // the main thread may reassign (sign-in, factory reset) while the
+    // fetch is in flight.
+    auto client = spotify_;
+
+    switch (section) {
+        case SpotifyHomeSection::DailyMix: {
+            const int seed = spotify_daily_seed();
+            status_line_ = "building today's daily mix ...";
+            launch_spotify_fetch([client, seed](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = "DAILY MIX";
+                // Three cheap, bounded reads. Not Liked Songs, which
+                // pages the whole library and would turn opening the
+                // home screen into dozens of requests.
+                //
+                // Partial failure is tolerated: the mix is built from
+                // whatever came back, and only all three failing is an
+                // error. A fresh account has no top tracks yet, and that
+                // shouldn't mean no daily mix.
+                std::vector<SpotifyTrack> now_favs, all_time, recent;
+                std::string err;
+                std::vector<DailyMixSource> sources;
+                if (client->top_tracks("short_term", 50, now_favs, &err) && !now_favs.empty())
+                    sources.push_back({std::move(now_favs), 5});
+                if (client->top_tracks("long_term", 50, all_time, &err) && !all_time.empty())
+                    sources.push_back({std::move(all_time), 3});
+                if (client->recently_played(50, recent, &err) && !recent.empty())
+                    sources.push_back({std::move(recent), 2});
+                if (sources.empty()) {
+                    f.error = err.empty() ? "no listening history to build a mix from" : err;
+                    return;
+                }
+                f.tracks = build_daily_mix(sources, seed);
+                f.success = true;
+            });
+            break;
+        }
+        case SpotifyHomeSection::JumpBackIn:
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = "JUMP BACK IN";
+                f.success = client->recently_played(50, f.tracks, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::TopTracks:
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = "YOUR TOP TRACKS";
+                f.success = client->top_tracks("short_term", 50, f.tracks, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::TopArtists:
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Artists;
+                f.label = "YOUR TOP ARTISTS";
+                f.success = client->top_artists("short_term", 50, f.artists, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::LikedSongs:
+            // Honest warning: this one really does page the whole
+            // library, which is slow for a large one.
+            status_line_ = "loading liked songs (reads your whole library) ...";
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = "LIKED SONGS";
+                f.success = client->saved_tracks(f.tracks, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::Playlists:
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Playlists;
+                f.label = "YOUR PLAYLISTS";
+                f.success = client->playlists(f.playlists, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::SavedAlbums:
+            launch_spotify_fetch([client](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Albums;
+                f.label = "SAVED ALBUMS";
+                f.success = client->saved_albums(f.albums, &f.error);
+            });
+            break;
+        case SpotifyHomeSection::Search:
+            // Opens the normal search bar pre-filled with the Spotify
+            // prefix, so there is one search affordance rather than a
+            // separate Spotify-only input.
+            mode_ = Mode::Search;
+            pre_search_list_source_ = list_source_;
+            pre_search_local_query_ = last_local_query_;
+            search_buffer_ = kSpotifySearchPrefix;
+            break;
+    }
+}
+
+void App::launch_spotify_search(const std::string& query) {
+    if (!ensure_spotify_client()) { status_line_ = spotify_unavailable_reason_; return; }
+    auto client = spotify_;
+    spotify_search_query_ = query;
+    list_source_ = ListSource::Spotify;
+    status_line_ = "searching spotify for \"" + query + "\" ...";
+    launch_spotify_fetch([client, query](SpotifyFetch& f) {
+        f.level = SpotifyLevel::Tracks;
+        f.label = "SEARCH: " + query;
+        f.success = client->search_tracks(query, 50, f.tracks, &f.error);
+    });
+}
+
+void App::spotify_activate_selected() {
+    const int idx = selected_;
+
+    // The one case where the home level has no rows: we never got a
+    // usable client. Enter then means "fix it", which for a missing
+    // token is the sign-in.
+    if (spotify_level_ == SpotifyLevel::Home && spotify_home_.empty()) {
+        launch_spotify_sign_in();
+        return;
+    }
+    if (idx < 0) return;
+
+    switch (spotify_level_) {
+        case SpotifyLevel::Home:
+            if (idx < static_cast<int>(spotify_home_.size()))
+                spotify_open_section(spotify_home_[idx].section);
+            return;
+
+        case SpotifyLevel::Tracks:
+            if (idx < static_cast<int>(spotify_tracks_.size()))
+                spotify_play_track(spotify_tracks_[idx]);
+            return;
+
+        case SpotifyLevel::Playlists: {
+            if (idx >= static_cast<int>(spotify_playlists_.size())) return;
+            auto client = spotify_;
+            const SpotifyPlaylist pl = spotify_playlists_[idx];
+            status_line_ = "loading \"" + pl.name + "\" ...";
+            launch_spotify_fetch([client, pl](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = pl.name;
+                f.success = client->playlist_tracks(pl, f.tracks, &f.error);
+            });
+            return;
+        }
+        case SpotifyLevel::Albums: {
+            if (idx >= static_cast<int>(spotify_albums_.size())) return;
+            auto client = spotify_;
+            const SpotifyAlbum ab = spotify_albums_[idx];
+            status_line_ = "loading \"" + ab.name + "\" ...";
+            launch_spotify_fetch([client, ab](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                f.label = ab.name;
+                f.success = client->album_tracks(ab, f.tracks, &f.error);
+            });
+            return;
+        }
+        case SpotifyLevel::Artists: {
+            if (idx >= static_cast<int>(spotify_artists_.size())) return;
+            auto client = spotify_;
+            const SpotifyArtist ar = spotify_artists_[idx];
+            status_line_ = "loading \"" + ar.name + "\" ...";
+            launch_spotify_fetch([client, ar](SpotifyFetch& f) {
+                f.level = SpotifyLevel::Tracks;
+                // An artist's own top tracks is as deep as artist
+                // browsing can go -- Related Artists is one of the
+                // endpoints Spotify restricted for new apps.
+                f.label = ar.name + " (top tracks)";
+                f.success = client->artist_top_tracks(ar, f.tracks, &f.error);
+            });
+            return;
+        }
+    }
+}
+
+void App::spotify_enqueue_selected() {
+    if (spotify_level_ != SpotifyLevel::Tracks) {
+        status_line_ = "only tracks can be queued -- open a playlist first";
+        return;
+    }
+    if (selected_ < 0 || selected_ >= static_cast<int>(spotify_tracks_.size())) return;
+    if (!ensure_spotify_client()) { status_line_ = spotify_unavailable_reason_; return; }
+
+    const SpotifyTrack t = spotify_tracks_[selected_];
+    // Appended locally right away so the panel reacts on this frame; the
+    // next poll replaces the list with Spotify's authoritative version.
+    spotify_queue_.push_back(t);
+    status_line_ = "queued on spotify: " + t.search_query();
+
+    auto client = spotify_;
+    const std::string uri = t.uri;
+    const std::string label = t.search_query();
+    spotify_run_command([this, client, uri, label]() {
+        std::string err;
+        if (!client->enqueue(uri, &err)) {
+            spotify_post_message(err.empty() ? "spotify refused the queue add" : err);
+            return;
+        }
+        spotify_post_message("queued on spotify: " + label);
+    });
+}
+
+bool App::spotify_back() {
+    switch (spotify_level_) {
+        case SpotifyLevel::Home:
+            return false; // let the normal Esc handler take us back to Local
+        case SpotifyLevel::Tracks:
+            // Back to whichever chooser we drilled in from, which for a
+            // section opened straight off the menu is the menu itself.
+            spotify_level_ = spotify_parent_level_;
+            break;
+        case SpotifyLevel::Playlists:
+        case SpotifyLevel::Artists:
+        case SpotifyLevel::Albums:
+            spotify_level_ = SpotifyLevel::Home;
+            break;
+    }
+    if (spotify_level_ == SpotifyLevel::Home && spotify_home_.empty()) spotify_load_home();
+    spotify_list_label_.clear();
+    selected_ = 0;
+    scroll_ = 0;
+    return true;
+}
+
+void App::yield_playback_to_spotify() {
+    // Exactly one decoder may be running. mousiki's player has to be
+    // stopped outright rather than paused: a paused device still holds
+    // the audio hardware, and nothing would ever resume it.
+    if (has_track_) {
+        player_.stop();
+        has_track_ = false;
+    }
+    current_pcm_.reset();
+    waveform_envelope_.clear();
+    waveform_ready_ = false;
+    ++waveform_epoch_;  // discard any in-flight waveform for the local track
+    fft_.reset();       // stop the previous track's spectrum tail from lingering
+}
+
+void App::spotify_play_track(const SpotifyTrack& t) {
+    if (!ensure_spotify_client()) { status_line_ = spotify_unavailable_reason_; return; }
+
+    // Is this already the playing track? Then Enter is a restart, not a
+    // change, and the derived work below (lyrics) would recompute an
+    // identical answer.
+    const bool already_current =
+        spotify_playing_ && !t.uri.empty() && spotify_status_.track.uri == t.uri;
+
+    // Hand the UI over FIRST and send the command afterwards. The call
+    // itself is 400-1100ms per round-trip and play_uri() may need three
+    // of them, so doing it the other way round froze the render loop for
+    // over two seconds on every track change.
+    //
+    // Bumping the generation here is what invalidates any status()
+    // request already in flight: it describes the previous track, and
+    // applying it would flip this panel straight back.
+    ++spotify_status_gen_;
+    spotify_expected_uri_ = t.uri;
+    spotify_expected_until_ =
+        std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(kSpotifyExpectSeconds));
+
+    yield_playback_to_spotify();
+    spotify_playing_ = true;
+
+    // Seeded from what we already know, so metadata and the progress bar
+    // are correct on the very next frame rather than after a poll.
+    spotify_status_ = SpotifyStatus{};
+    spotify_status_.is_running = true;
+    spotify_status_.player.state = "playing";
+    spotify_status_.player.position_ms = 0;
+    spotify_status_.player.duration_ms = t.duration_ms;
+    spotify_status_.track.name = t.name;
+    spotify_status_.track.artist = t.artist;
+    spotify_status_.track.album = t.album;
+    spotify_status_.track.uri = t.uri;
+    spotify_status_at_ = std::chrono::steady_clock::now();
+    apply_spotify_metadata();
+
+    // Lyrics work here, off better tags than the yt-dlp path's: these are
+    // Spotify's own rather than a guess from an uploader's video title.
+    // Fired once, from here -- the expected-uri guard above is what keeps
+    // the poll path from firing another for the same track. No path, so
+    // no .lrc sidecar to read or write.
+    //
+    // Skipped when this is the track already playing (Enter on it just
+    // restarts it from the top): the lyrics on screen are already the
+    // right ones, and refetching costs three more provider requests for
+    // a result that cannot differ.
+    if (spotify_lyrics_uri_ != t.uri) {
+        spotify_lyrics_uri_ = t.uri;
+        last_lyrics_status_.clear();
+        launch_lyrics_fetch(t.name, t.artist, fs::path());
+    }
+
+    status_line_ = (already_current ? "restarting on spotify: " : "starting on spotify: ")
+                 + t.search_query();
+    start_spotify_poll();
+
+    auto client = spotify_;
+    const std::string uri = t.uri;
+    const std::string label = t.search_query();
+    spotify_run_command([this, client, uri, label]() {
+        std::string err, device;
+        if (!client->play_uri(uri, &err, &device)) {
+            spotify_post_message(err.empty() ? "spotify refused to play that" : err);
+            return;
+        }
+        // Naming the device matters in a way it wouldn't for a local
+        // file: play_uri() may have had to wake an idle client, and that
+        // client can be a different machine. "Nothing happened" and
+        // "it's playing in the other room" look identical from here.
+        spotify_post_message(device.empty() ? "playing on spotify: " + label
+                                            : "playing on " + device + ": " + label);
+    });
+}
+
+void App::apply_spotify_metadata() {
+    metadata_ = TrackMetadata{};
+    metadata_.name = spotify_status_.track.name;
+    metadata_.artist = spotify_status_.track.artist.empty() ? "-" : spotify_status_.track.artist;
+    metadata_.year = "-";
+    // These three describe a decoded file, and there is no file. Saying
+    // so beats a dash, which reads as "we tried and failed".
+    metadata_.sampling = "n/a (remote)";
+    metadata_.format = "spotify stream";
+    metadata_.file_size = "n/a (remote)";
+    metadata_.type = "audio only";
+    metadata_.location = spotify_status_.device.empty() ? "spotify" : spotify_status_.device;
+    if (!spotify_status_.track.album.empty()) {
+        metadata_.extra_label = "album";
+        metadata_.extra_value = spotify_status_.track.album;
+    }
+}
+
+double App::spotify_elapsed_sec() const {
+    if (!spotify_playing_) return 0.0;
+    const double base = static_cast<double>(spotify_status_.player.position_ms) / 1000.0;
+    // Paused: frozen at whatever the last poll saw. Interpolating would
+    // walk the bar forward while the music isn't moving.
+    if (spotify_status_.player.state != "playing") return base;
+
+    const double since =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - spotify_status_at_).count();
+    double out = base + since;
+    // Never run past the end: the poll interval is up to 5s, so without
+    // this the bar would overshoot into the next track's first seconds.
+    const double dur = static_cast<double>(spotify_status_.player.duration_ms) / 1000.0;
+    if (dur > 0.0) out = std::min(out, dur);
+    return out;
+}
+
+double App::display_elapsed_sec() const {
+    if (spotify_playing_) return spotify_elapsed_sec();
+    return has_track_ ? player_.poll_elapsed() : 0.0;
+}
+
+size_t App::display_total_sec() const {
+    if (spotify_playing_)
+        return static_cast<size_t>(std::max<long long>(0, spotify_status_.player.duration_ms / 1000));
+    return total_sec_;
+}
+
+// ---------------------------------------------------------------------
+// Now-playing poll
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Command worker -- keeps every Spotify round-trip off the render thread
+// ---------------------------------------------------------------------
+
+void App::spotify_run_command(std::function<void()> work) {
+    if (!spotify_cmd_started_.exchange(true)) {
+        spotify_cmd_thread_ = std::thread([this]() {
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> lk(spotify_cmd_mutex_);
+                    spotify_cmd_cv_.wait(lk, [this]() {
+                        return spotify_cmd_stop_.load() || !spotify_cmd_queue_.empty();
+                    });
+                    if (spotify_cmd_stop_.load() && spotify_cmd_queue_.empty()) return;
+                    job = std::move(spotify_cmd_queue_.front());
+                    spotify_cmd_queue_.pop_front();
+                }
+                job(); // outside the lock: this blocks on the network
+            }
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lk(spotify_cmd_mutex_);
+        spotify_cmd_queue_.push_back(std::move(work));
+    }
+    spotify_cmd_cv_.notify_one();
+}
+
+void App::stop_spotify_cmd_worker() {
+    if (!spotify_cmd_started_.load()) return;
+    spotify_cmd_stop_ = true;
+    spotify_cmd_cv_.notify_all();
+    if (spotify_cmd_thread_.joinable()) spotify_cmd_thread_.join();
+}
+
+void App::spotify_post_message(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(spotify_msg_mutex_);
+    spotify_msgs_.push_back(msg);
+}
+
+void App::poll_pending_spotify_messages() {
+    std::vector<std::string> msgs;
+    {
+        std::lock_guard<std::mutex> lk(spotify_msg_mutex_);
+        if (spotify_msgs_.empty()) return;
+        msgs.swap(spotify_msgs_);
+    }
+    // Only the newest reaches the status line (it is one line), but all
+    // of them reach the log so nothing is silently lost.
+    for (const auto& m : msgs) log_event(m);
+    status_line_ = msgs.back();
+}
+
+void App::start_spotify_poll() {
+    if (!spotify_) return;
+    // A thread that is running but has already been asked to stop is not
+    // a reason to skip starting: it is about to exit, and returning early
+    // here would leave nothing polling at all. Join it out first instead.
+    if (spotify_poll_running_.load() && !spotify_poll_stop_.load()) return;
+    if (spotify_poll_running_.load()) stop_spotify_poll();
+    if (spotify_poll_thread_.joinable()) spotify_poll_thread_.join();
+
+    auto client = spotify_;
+    // settings.cpp floors the configured value at 1000ms; the Web API
+    // backend needs a higher floor to stay inside Spotify's rate limits,
+    // since each tick costs two requests (state + queue).
+    const int interval = std::max(settings_.spotify_poll_interval_ms,
+                                  client->supports_library() ? 5000 : 1000);
+    spotify_poll_stop_ = false;
+    spotify_poll_running_ = true;
+
+    spotify_poll_thread_ = std::thread([this, client, interval]() {
+        while (!spotify_poll_stop_.load()) {
+            // Captured BEFORE the request: this is the world-state this
+            // reading describes. If a local action bumps the counter
+            // while the request is in flight, the reading is already
+            // obsolete and gets dropped rather than applied.
+            const int gen = spotify_status_gen_.load();
+
+            SpotifyStatus st;
+            std::string err;
+            const bool ok = client->status(st, &err);
+
+            std::vector<SpotifyTrack> up_next;
+            // Only worth asking when something is actually loaded --
+            // with no active device the queue endpoint has nothing to
+            // say and would just burn a request every tick.
+            if (ok && st.is_running) client->queue(up_next, nullptr);
+
+            if (ok) {
+                std::lock_guard<std::mutex> lk(spotify_status_mutex_);
+                if (gen == spotify_status_gen_.load()) { // still current
+                    pending_spotify_status_ = std::move(st);
+                    pending_spotify_queue_ = std::move(up_next);
+                    pending_spotify_status_gen_ = gen;
+                    spotify_status_ready_ = true;
+                }
+            }
+
+            // Slept in slices so stop_spotify_poll() doesn't have to
+            // wait out a whole interval (up to 5s) on quit -- and so a
+            // local action can cut the wait short: after pressing play
+            // the user expects the panel to catch up in a moment, not
+            // on the next five-second tick.
+            for (int slept = 0; slept < interval && !spotify_poll_stop_.load(); slept += 100) {
+                if (spotify_status_gen_.load() != gen) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        spotify_poll_running_ = false;
+    });
+}
+
+void App::stop_spotify_poll() {
+    spotify_poll_stop_ = true;
+    if (spotify_poll_thread_.joinable()) spotify_poll_thread_.join();
+    spotify_poll_running_ = false;
+}
+
+void App::poll_pending_spotify_status() {
+    if (!spotify_status_ready_.load()) return;
+    SpotifyStatus st;
+    std::vector<SpotifyTrack> up_next;
+    int st_gen = 0;
+    {
+        std::lock_guard<std::mutex> lk(spotify_status_mutex_);
+        st = std::move(pending_spotify_status_);
+        up_next = std::move(pending_spotify_queue_);
+        st_gen = pending_spotify_status_gen_;
+        spotify_status_ready_ = false;
+    }
+    // Consume-side half of the generation guard. The publish-side check
+    // cannot catch a reading that was already in the slot when a local
+    // action happened -- this one can.
+    if (st_gen != spotify_status_gen_.load()) return;
+
+    const std::string prev_uri = spotify_status_.track.uri;
+
+    ConsoleLog::instance().log_verbose(
+        "spotify poll: st.uri=" + (st.track.uri.empty() ? std::string("(none)") : st.track.uri.substr(st.track.uri.size()-6)) +
+        " prev=" + (prev_uri.empty() ? std::string("(none)") : prev_uri.substr(prev_uri.size()-6)) +
+        " lyr=" + (spotify_lyrics_uri_.empty() ? std::string("(none)") : spotify_lyrics_uri_.substr(spotify_lyrics_uri_.size()-6)) +
+        " exp=" + (spotify_expected_uri_.empty() ? std::string("(none)") : spotify_expected_uri_.substr(spotify_expected_uri_.size()-6)) +
+        " running=" + (st.is_running ? "1" : "0") + " gen=" + std::to_string(st_gen));
+
+    // Waiting on a track we just asked for? Then a reading that still
+    // shows something else is Spotify not having switched yet, not the
+    // user changing tracks elsewhere. Take the live numbers from it but
+    // keep the track identity we are expecting, so the panel doesn't
+    // flash back to the previous song and no lyrics fetch fires for it.
+    const bool expecting = !spotify_expected_uri_.empty() &&
+                           std::chrono::steady_clock::now() < spotify_expected_until_;
+    if (expecting && st.is_running && st.track.uri != spotify_expected_uri_) {
+        spotify_status_.player.volume = st.player.volume;
+        spotify_status_.player.is_shuffling = st.player.is_shuffling;
+        spotify_status_.player.is_repeating = st.player.is_repeating;
+        if (!st.device.empty()) spotify_status_.device = st.device;
+        spotify_queue_ = std::move(up_next);
+        ConsoleLog::instance().log_basic("  [EARLY RETURN] nunggu uri diminta");
+        return;
+    }
+    // Confirmed (or the expectation timed out) -- stop second-guessing
+    // the poll from here on.
+    if (!spotify_expected_uri_.empty() &&
+        (!expecting || st.track.uri == spotify_expected_uri_)) {
+        spotify_expected_uri_.clear();
+    }
+
+    spotify_status_ = std::move(st);
+    spotify_status_at_ = std::chrono::steady_clock::now();
+    spotify_queue_ = std::move(up_next);
+
+    // Spotify stopped (or moved to a device we can't see): hand the
+    // "what's playing" role back rather than leaving a frozen panel
+    // claiming a track is on.
+    if (!spotify_status_.is_running) {
+        if (spotify_playing_) {
+            spotify_playing_ = false;
+            spotify_lyrics_uri_.clear(); // coming back to this track later should refetch
+            status_line_ = "spotify stopped";
+        }
+        return;
+    }
+
+    // Spotify advanced to the next track on its own (its queue, its
+    // repeat/shuffle -- mousiki deliberately doesn't drive that). Refresh
+    // what's derived from the track identity.
+    if (spotify_status_.track.uri != prev_uri && !spotify_status_.track.uri.empty()) {
+        // has_track_ guard: Spotify playing on the user's phone while
+        // mousiki decodes a local file is a normal state, and without
+        // this the panels would follow the phone's track while local
+        // audio is what's in the speakers. Whatever mousiki is decoding
+        // wins; Spotify takes the role only when spotify_play_track()
+        // hands it over through yield_playback_to_spotify().
+        if (has_track_) return;
+        spotify_playing_ = true;
+        apply_spotify_metadata();
+        // Only if nobody has already fetched these -- the local play path
+        // normally gets here first, and Spotify's URI relinking means
+        // the uri it reports back is not always the one we asked for.
+        if (spotify_lyrics_uri_ != spotify_status_.track.uri) {
+            spotify_lyrics_uri_ = spotify_status_.track.uri;
+            last_lyrics_status_.clear();
+            launch_lyrics_fetch(spotify_status_.track.name, spotify_status_.track.artist, fs::path());
+        }
+        ConsoleLog::instance().log_basic("  [BRANCH !=] masuk cabang, lyr=" + (spotify_lyrics_uri_.empty()?std::string("(none)"):spotify_lyrics_uri_.substr(spotify_lyrics_uri_.size()-6)) + " st=" + (spotify_status_.track.uri.empty()?std::string("(none)"):spotify_status_.track.uri.substr(spotify_status_.track.uri.size()-6)));
+        log_event("spotify: now playing " + spotify_status_.display());
+    } else if (spotify_playing_) {
+        // Same track: the volume/device/state rows can still have moved.
+        apply_spotify_metadata();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Sign-in
+// ---------------------------------------------------------------------
+
+void App::launch_spotify_sign_in() {
+    if (spotify_auth_in_progress_.load()) {
+        status_line_ = "sign-in already in progress -- check your browser";
+        return;
+    }
+    if (settings_.spotify_client_id.empty()) {
+        status_line_ = "set SpotifyClientId in config.txt first (developer.spotify.com/dashboard)";
+        return;
+    }
+    if (spotify_auth_thread_.joinable()) spotify_auth_thread_.join();
+
+    spotify_auth_in_progress_ = true;
+    spotify_auth_done_ = false;
+    status_line_ = "opening browser for Spotify sign-in ...";
+    log_event("spotify: sign-in started");
+
+    const std::string client_id = settings_.spotify_client_id;
+    spotify_auth_thread_ = std::thread([this, client_id]() {
+        SpotifyTokens tokens;
+        std::string err;
+        // Blocks on a loopback socket until the browser redirects back,
+        // giving up after its own timeout. Hence the thread.
+        const bool ok = SpotifyAuth::interactive_login(client_id, tokens, &err);
+        {
+            std::lock_guard<std::mutex> lk(spotify_auth_mutex_);
+            spotify_auth_success_ = ok;
+            spotify_auth_error_ = err;
+        }
+        spotify_auth_done_ = true;
+    });
+}
+
+void App::poll_pending_spotify_auth() {
+    if (!spotify_auth_done_.load()) return;
+    bool ok = false;
+    std::string err;
+    {
+        std::lock_guard<std::mutex> lk(spotify_auth_mutex_);
+        ok = spotify_auth_success_;
+        err = spotify_auth_error_;
+    }
+    spotify_auth_done_ = false;
+    spotify_auth_in_progress_ = false;
+    if (spotify_auth_thread_.joinable()) spotify_auth_thread_.join();
+
+    if (!ok) {
+        status_line_ = err.empty() ? "Spotify sign-in failed" : err;
+        log_event("spotify: sign-in failed -- " + status_line_);
+        return;
+    }
+    // The cached client was built (or refused) against the old token
+    // state, so it has to be dropped before anything asks for one again.
+    SpotifyClientFactory::reset();
+    spotify_.reset();
+    status_line_ = "signed in to Spotify";
+    log_event("spotify: signed in");
+    if (list_source_ == ListSource::Spotify) enter_spotify();
+}
+
+// Builds one display string per row for whichever Spotify level is
+// showing, each exactly as wide as the caller's `inner` allows. Column
+// widths mirror the local-files list where the data lines up (index,
+// title, artist, mm:ss) so switching between the two doesn't feel like
+// a different application.
+std::vector<std::string> App::build_spotify_list_rows(int inner) const {
+    std::vector<std::string> rows;
+    const std::string& sep = settings_.list_separator;
+    const int idx_w = 3;
+    auto fm = [&](const std::string& t) { return apply_font_map(t, settings_.font_map); };
+
+    // No usable backend: explain it in the panel instead of showing an
+    // empty list, which would read as "this account has nothing in it".
+    if (spotify_level_ == SpotifyLevel::Home && spotify_home_.empty()) {
+        rows.push_back("");
+        rows.push_back("  spotify is not available:");
+        rows.push_back("  " + (spotify_unavailable_reason_.empty() ? std::string("unknown reason")
+                                                                  : spotify_unavailable_reason_));
+        rows.push_back("");
+        if (!settings_.spotify_client_id.empty()) {
+            rows.push_back("  press ENTER to sign in");
+            rows.push_back("  (opens accounts.spotify.com in your browser)");
+        } else {
+            rows.push_back("  add SpotifyClientId to $HOME/.config/mousiki/config.txt");
+            rows.push_back("  get one free at developer.spotify.com/dashboard");
+        }
+        return rows;
+    }
+
+    switch (spotify_level_) {
+        case SpotifyLevel::Home: {
+            const int detail_w = std::min(16, std::max(0, inner / 3));
+            const int label_w = std::max(5, inner - 2 - 2 - 2 - detail_w);
+            for (const auto& r : spotify_home_) {
+                rows.push_back("▸ " + pad_right(truncate_str(fm(r.label), label_w), label_w)
+                               + sep + " " + truncate_str(fm(r.detail), detail_w));
+            }
+            return rows;
+        }
+        case SpotifyLevel::Tracks: {
+            const int artist_w = 16;
+            const int dur_w = 5;
+            const int title_w = std::max(5, inner - idx_w - 2 - 2 - artist_w - 2 - dur_w);
+            for (size_t i = 0; i < spotify_tracks_.size(); ++i) {
+                const auto& t = spotify_tracks_[i];
+                // Duration comes straight from Spotify's duration_ms, so
+                // unlike the local list there is nothing to probe and no
+                // row that sits blank waiting for ffprobe.
+                const std::string dur = fmt_mmss(static_cast<double>(t.duration_ms) / 1000.0);
+                rows.push_back(pad_right(fm(std::to_string(i + 1)), idx_w) + sep + " "
+                               + pad_right(truncate_str(fm(t.name), title_w), title_w) + sep + " "
+                               + pad_right(truncate_str(fm(t.artist), artist_w), artist_w) + sep + " "
+                               + fm(dur));
+            }
+            return rows;
+        }
+        case SpotifyLevel::Playlists: {
+            const int count_w = 11; // "1234 tracks"
+            const int name_w = std::max(5, inner - idx_w - 2 - 2 - count_w);
+            for (size_t i = 0; i < spotify_playlists_.size(); ++i) {
+                const auto& pl = spotify_playlists_[i];
+                rows.push_back(pad_right(fm(std::to_string(i + 1)), idx_w) + sep + " "
+                               + pad_right(truncate_str(fm(pl.name), name_w), name_w) + sep + " "
+                               + fm(std::to_string(pl.track_count) + " tracks"));
+            }
+            return rows;
+        }
+        case SpotifyLevel::Artists: {
+            const int genre_w = std::min(24, std::max(0, inner / 3));
+            const int name_w = std::max(5, inner - idx_w - 2 - 2 - genre_w);
+            for (size_t i = 0; i < spotify_artists_.size(); ++i) {
+                const auto& ar = spotify_artists_[i];
+                rows.push_back(pad_right(fm(std::to_string(i + 1)), idx_w) + sep + " "
+                               + pad_right(truncate_str(fm(ar.name), name_w), name_w) + sep + " "
+                               + truncate_str(fm(ar.genres), genre_w));
+            }
+            return rows;
+        }
+        case SpotifyLevel::Albums: {
+            const int artist_w = 16;
+            const int year_w = 4;
+            const int name_w = std::max(5, inner - idx_w - 2 - 2 - artist_w - 2 - year_w);
+            for (size_t i = 0; i < spotify_albums_.size(); ++i) {
+                const auto& ab = spotify_albums_[i];
+                rows.push_back(pad_right(fm(std::to_string(i + 1)), idx_w) + sep + " "
+                               + pad_right(truncate_str(fm(ab.name), name_w), name_w) + sep + " "
+                               + pad_right(truncate_str(fm(ab.artist), artist_w), artist_w) + sep + " "
+                               + fm(ab.year()));
+            }
+            return rows;
+        }
+    }
+    return rows;
+}
+
+size_t App::current_list_len() const {
+    switch (list_source_) {
+        case ListSource::Local:   return local_view_.size();
+        case ListSource::Online:  return online_view_.size();
+        case ListSource::Spotify: return spotify_level_len();
+    }
+    return 0;
+}
+
 void App::play_selected() {
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    // Spotify first: its rows aren't all tracks (the home menu, playlist
+    // and album rows all drill in rather than play), so Enter there is a
+    // navigation action, not a playback one.
+    if (list_source_ == ListSource::Spotify) { spotify_activate_selected(); return; }
+    size_t list_len = current_list_len();
     if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
     if (list_source_ == ListSource::Local) start_local_track(local_view_[selected_]);
     else start_online_track(online_view_[selected_]);
@@ -863,13 +1782,32 @@ void App::play_selected() {
 // supposed to make cursor and playback coincide; everything else that
 // moves playback goes through this instead.
 void App::play_at_list_index(int idx) {
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    size_t list_len = current_list_len();
     if (idx < 0 || idx >= static_cast<int>(list_len)) return;
+    if (list_source_ == ListSource::Spotify) {
+        // Only a track list has anything to play at an index; the menu
+        // and the playlist/album/artist choosers don't.
+        if (spotify_level_ == SpotifyLevel::Tracks && idx < static_cast<int>(spotify_tracks_.size())) {
+            spotify_play_track(spotify_tracks_[idx]);
+        }
+        return;
+    }
     if (list_source_ == ListSource::Local) start_local_track(local_view_[idx]);
     else start_online_track(online_view_[idx]);
 }
 
 int App::current_track_list_index() const {
+    // Spotify's "what's playing" lives in spotify_status_, not in
+    // current_path_/current_video_id_, and is matched by track uri.
+    if (list_source_ == ListSource::Spotify) {
+        if (!spotify_playing_ || spotify_level_ != SpotifyLevel::Tracks) return -1;
+        const std::string& uri = spotify_status_.track.uri;
+        if (uri.empty()) return -1;
+        for (size_t i = 0; i < spotify_tracks_.size(); ++i) {
+            if (spotify_tracks_[i].uri == uri) return static_cast<int>(i);
+        }
+        return -1;
+    }
     if (!has_track_) return -1;
     if (list_source_ == ListSource::Local) {
         if (!current_is_local_) return -1; // playing an online track while browsing the local list
@@ -887,7 +1825,7 @@ int App::current_track_list_index() const {
 }
 
 void App::play_relative(int delta, int precomputed_base) {
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    size_t list_len = current_list_len();
     if (list_len == 0) return;
     // Relative to what's actually *playing*, not wherever the hover
     // cursor happens to be sitting -- falls back to the hover cursor
@@ -903,7 +1841,7 @@ void App::play_relative(int delta, int precomputed_base) {
 }
 
 void App::play_relative_random(int precomputed_base) {
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    size_t list_len = current_list_len();
     if (list_len == 0) return;
     if (list_len == 1) { play_at_list_index(0); return; }
     static std::mt19937 rng(std::random_device{}());
@@ -1007,7 +1945,10 @@ char App::play_mode_letter() const {
 }
 
 void App::queue_add_selected() {
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    // Spotify's queue is the account's, shared with every other client
+    // signed in to it -- adding there is an API call, not a push_back.
+    if (list_source_ == ListSource::Spotify) { spotify_enqueue_selected(); return; }
+    size_t list_len = current_list_len();
     if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
     if (list_source_ == ListSource::Local) {
         const auto& t = local_view_[selected_];
@@ -1109,13 +2050,19 @@ void App::restore_snapshot(const SnapshotData& snap) {
 
     if (snap.has_now_playing) {
         resume_start_sec_ = std::max(0.0, snap.position_sec);
+        // The track is still fully loaded and seeked to where it was --
+        // metadata, waveform, lyrics and the progress bar all come back
+        // -- it simply doesn't start itself. One keypress resumes it.
+        start_paused_ = !settings_.autoplay_on_start;
         if (snap.now_playing.is_local) {
             fs::path p(snap.now_playing.path);
             std::error_code ec;
             if (fs::exists(p, ec)) {
                 LocalTrack t{p.stem().string(), p, snap.now_playing.artist};
                 start_local_track(t);
-                log_event("resuming: " + t.title);
+                log_event(settings_.autoplay_on_start
+                              ? "resuming: " + t.title
+                              : "restored (paused): " + t.title + " -- press p to play");
             } else {
                 resume_start_sec_ = 0.0; // file's gone -- nothing to resume into
             }
@@ -1677,14 +2624,20 @@ void App::handle_key(int key) {
     }
 
     // Mode::Browse
-    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    size_t list_len = current_list_len();
 
     switch (key) {
-        case 's': case 'S':
+        case 's':
             mode_ = Mode::Settings;
             settings_tab_ = 0;
             settings_row_ = 0;
             settings_col_ = 0;
+            break;
+        case 'S': // Spotify view. Split off from Settings, which used to
+                  // answer both cases -- config.txt has always documented
+                  // the Settings key as lowercase "s" (HKeySetting="s"),
+                  // so the uppercase half was a spare.
+            enter_spotify();
             break;
         case 9: // Tab: toggle Up/Down + reorder focus between the list and the queue
             queue_focus_ = !queue_focus_;
@@ -1711,7 +2664,27 @@ void App::handle_key(int key) {
             }
             break;
         case 'C': // right = seek forward
-            if (has_track_) player_.seek_relative(5.0);
+            // Seeking a Spotify track is a request to Spotify, not a
+            // buffer offset -- and it needs an absolute target, so the
+            // relative nudge is applied to the interpolated position.
+            if (spotify_playing_ && spotify_) {
+                // Applied locally first so the bar moves on this frame;
+                // the request goes out on the worker. Bumping the
+                // generation stops an in-flight poll from reporting the
+                // pre-seek position and yanking the bar backwards.
+                const long long target =
+                    static_cast<long long>(std::max(0.0, spotify_elapsed_sec() + 5.0) * 1000.0);
+                spotify_status_.player.position_ms = target;
+                spotify_status_at_ = std::chrono::steady_clock::now();
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, target]() {
+                    std::string err;
+                    if (!client->seek(target, &err)) spotify_post_message(err);
+                });
+            } else if (has_track_) {
+                player_.seek_relative(5.0);
+            }
             break;
         case 'D': // left = seek back ... OR, while queue-focused, move the hovering queue item down.
             // Left-arrow and Shift+D are indistinguishable at the terminal-
@@ -1721,19 +2694,73 @@ void App::handle_key(int key) {
             // trade since you're not usually seeking while reordering a
             // queue anyway.
             if (queue_focus_) queue_move_hovering(1);
-            else if (has_track_) player_.seek_relative(-5.0);
+            else if (spotify_playing_ && spotify_) {
+                const long long target =
+                    static_cast<long long>(std::max(0.0, spotify_elapsed_sec() - 5.0) * 1000.0);
+                spotify_status_.player.position_ms = target;
+                spotify_status_at_ = std::chrono::steady_clock::now();
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, target]() {
+                    std::string err;
+                    if (!client->seek(target, &err)) spotify_post_message(err);
+                });
+            } else if (has_track_) {
+                player_.seek_relative(-5.0);
+            }
             break;
         case 'u': case 'U': // move the hovering queue item up (only meaningful once you've Tab'd into the queue)
             queue_move_hovering(-1);
             break;
         case 'p': case 'P': // play/pause
-            if (has_track_) { if (player_.is_paused()) player_.resume(); else player_.pause(); }
+            if (spotify_playing_ && spotify_) {
+                // Flip locally first so the bar stops/starts
+                // interpolating on this frame rather than at the next
+                // poll, and so the key feels instant despite the
+                // round-trip behind it.
+                const bool was_playing = (spotify_status_.player.state == "playing");
+                spotify_status_.player.position_ms =
+                    static_cast<long long>(spotify_elapsed_sec() * 1000.0);
+                spotify_status_.player.state = was_playing ? "paused" : "playing";
+                spotify_status_at_ = std::chrono::steady_clock::now();
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, was_playing]() {
+                    std::string err;
+                    const bool ok = was_playing ? client->pause(&err) : client->play(&err);
+                    if (!ok) spotify_post_message(err.empty() ? "spotify refused that" : err);
+                });
+            } else if (has_track_) {
+                if (player_.is_paused()) player_.resume(); else player_.pause();
+            }
             break;
         case '1': // volume up
-            if (has_track_) player_.set_volume(std::min(100, player_.volume() + 5));
+            if (spotify_playing_ && spotify_) {
+                const int v = std::min(100, spotify_status_.player.volume + 5);
+                spotify_status_.player.volume = v;
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, v]() {
+                    std::string err;
+                    if (!client->set_volume(v, &err)) spotify_post_message(err);
+                });
+            } else if (has_track_) {
+                player_.set_volume(std::min(100, player_.volume() + 5));
+            }
             break;
         case '2': // volume down
-            if (has_track_) player_.set_volume(std::max(0, player_.volume() - 5));
+            if (spotify_playing_ && spotify_) {
+                const int v = std::max(0, spotify_status_.player.volume - 5);
+                spotify_status_.player.volume = v;
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, v]() {
+                    std::string err;
+                    if (!client->set_volume(v, &err)) spotify_post_message(err);
+                });
+            } else if (has_track_) {
+                player_.set_volume(std::max(0, player_.volume() - 5));
+            }
             break;
         case 'n': case 'N': // next -- the queue (if any) takes priority,
                              // same as auto-advance-on-finish does, and
@@ -1742,14 +2769,42 @@ void App::handle_key(int key) {
                              // still always actually skips, though --
                              // Repeat/Stop only govern *automatic*
                              // advance, not an explicit "n" press).
-            if (!queue_.empty()) play_next_from_queue();
-            else play_relative(1);
+            // Spotify advances through its own queue, with its own
+            // shuffle/repeat. mousiki just asks for the skip.
+            if (spotify_playing_ && spotify_) {
+                // No expected-uri here: mousiki doesn't know what
+                // Spotify will advance to (its queue, its shuffle). The
+                // generation bump is still needed so the pre-skip
+                // reading is discarded, and the shortened sleep means
+                // the new track shows up in about a second.
+                ++spotify_status_gen_;
+                status_line_ = "skipping ...";
+                auto client = spotify_;
+                spotify_run_command([this, client]() {
+                    std::string err;
+                    if (!client->next(&err)) spotify_post_message(err);
+                });
+            } else if (!queue_.empty()) {
+                play_next_from_queue();
+            } else {
+                play_relative(1);
+            }
             break;
         case 'b': // prev -- relative to what's actually playing (see
                   // current_track_list_index()), not the hover cursor.
                   // No queue equivalent: a FIFO queue has no well-defined
                   // "previous" once an item's been consumed.
-            play_relative(-1);
+            if (spotify_playing_ && spotify_) {
+                ++spotify_status_gen_;
+                status_line_ = "going back ...";
+                auto client = spotify_;
+                spotify_run_command([this, client]() {
+                    std::string err;
+                    if (!client->previous(&err)) spotify_post_message(err);
+                });
+            } else {
+                play_relative(-1);
+            }
             break;
         case 'a': // add hovering song to queue (List focus) -- or, when
                   // the Queue panel itself is focused, "a" has nothing
@@ -1771,8 +2826,14 @@ void App::handle_key(int key) {
             }
             break;
         case 'd': // remove hovering queue item
-            queue_remove_hovering();
-            log_event("removed from queue");
+            if (list_source_ == ListSource::Spotify) {
+                // The Web API can append to the account queue but has
+                // no reorder or remove, so there is nothing to call.
+                status_line_ = "spotify's queue can't be edited from the api -- only added to";
+            } else {
+                queue_remove_hovering();
+                log_event("removed from queue");
+            }
             break;
         case 'm': case 'M': // cycle play mode: list -> repeat -> shuffle
                              // -> repeat queue -> stop -> list -- one key
@@ -1800,6 +2861,20 @@ void App::handle_key(int key) {
             mode_ = Mode::Console;
             break;
         case 'x': case 'X': // mute -- force volume to 0 without touching pause state
+            if (spotify_playing_ && spotify_) {
+                const int target = muted_ ? pre_mute_volume_ : 0;
+                if (!muted_) pre_mute_volume_ = spotify_status_.player.volume;
+                spotify_status_.player.volume = target;
+                muted_ = !muted_;
+                log_event(muted_ ? "muted (spotify)" : "unmuted (spotify)");
+                ++spotify_status_gen_;
+                auto client = spotify_;
+                spotify_run_command([this, client, target]() {
+                    std::string err;
+                    if (!client->set_volume(target, &err)) spotify_post_message(err);
+                });
+                break;
+            }
             if (!muted_) {
                 pre_mute_volume_ = player_.volume();
                 player_.set_volume(0);
@@ -1899,6 +2974,18 @@ void App::handle_key(int key) {
                  // filter, from the top. Same destination regardless of
                  // how buried you are (mid search results, viewing
                  // online results, scrolled deep into the list).
+            // In the Spotify view Esc first walks back up its own
+            // hierarchy (tracks -> chooser -> home) and only falls
+            // through to "leave Spotify" once it's at the top.
+            if (list_source_ == ListSource::Spotify && spotify_back()) break;
+            if (list_source_ == ListSource::Spotify && !spotify_playing_) {
+                // Leaving Spotify with nothing playing there: stop the
+                // heartbeat rather than polling the API forever in the
+                // background. Requested rather than joined -- a join on a
+                // keypress would stall the render thread for up to one
+                // sleep slice.
+                spotify_poll_stop_ = true;
+            }
             list_source_ = ListSource::Local;
             last_local_query_.clear();
             folder_filter_.clear();
@@ -1948,9 +3035,9 @@ void App::ensure_visible_row_meta() {
             RowMeta rm;
             rm.duration_sec = static_cast<double>(dur);
             std::lock_guard<std::mutex> lk(row_meta_mutex_);
-            // BUG FIX #1: cap the cache so it can't grow proportionally
-            // to an arbitrarily large library (a 50k-track collection
-            // would otherwise accumulate tens of MB that are never freed).
+            // Capped so the cache can't grow with the library: a 50k
+            // track collection would otherwise accumulate tens of MB
+            // that are never freed.
             if (row_meta_cache_.size() < 4096)
                 row_meta_cache_[key] = rm;
         }
@@ -1970,7 +3057,7 @@ void App::recompute_waveform_for_current_track() {
     if (!has_track_ || !current_pcm_) return;
     std::shared_ptr<StreamingPcm> pcm = current_pcm_;
     bool smooth = settings_.waveform_smooth;
-    // BUG FIX #5: increment epoch before spawning — any already-running
+    // Increment the epoch before spawning — any already-running
     // waveform thread will see its own epoch is stale and discard its
     // result instead of racing to overwrite pending_waveform_envelope_.
     int my_epoch = ++waveform_epoch_;
@@ -2006,7 +3093,7 @@ void App::launch_row_meta_resolver() {
             }
             RowMeta rm = probe_row_meta(p); // ffprobe fallback — slow, but background-thread-only now
             std::lock_guard<std::mutex> lk(row_meta_mutex_);
-            if (row_meta_cache_.size() < 4096) // BUG FIX #1: same cap as ensure_visible_row_meta
+            if (row_meta_cache_.size() < 4096) // same cap as ensure_visible_row_meta
                 row_meta_cache_[key] = rm;
         }
     }).detach();
@@ -2046,7 +3133,11 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
         }
     }
 
-    double elapsed = has_track_ ? player_.poll_elapsed() : 0.0;
+    // display_elapsed_sec() rather than player_ directly: while Spotify
+    // owns playback, player_ isn't playing anything and the real
+    // position comes from the polled Spotify state, interpolated forward
+    // between polls (see spotify_elapsed_sec()).
+    double elapsed = display_elapsed_sec();
     fft_.set_fluidity(settings_.visualizer_fluidity);
     fft_.set_degradation_speed(settings_.visualizer_degradation_speed);
     fft_.set_viscosity(settings_.visualizer_viscosity);
@@ -2055,7 +3146,11 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
     std::vector<std::string> meta_rows(panel_h, std::string());
     bool viz_rows_colored = false;
     std::vector<int> bars; // computed once below, reused by the sphere visualizer fallback further down
-    if (has_track_) {
+    // showing_track(), not has_track_: a Spotify track is playing even
+    // though mousiki's own player is idle. The spectrum strip still
+    // renders, with its bars at zero -- fft_ is fed from the audio
+    // callback, and Spotify's decoding produces none.
+    if (showing_track()) {
         std::string k_col = settings_.meta_key_color.empty() ? ansi_for(settings_.list_color) : ansi_for(settings_.meta_key_color);
         std::string v_col = settings_.meta_val_color.empty() ? ansi_for(settings_.list_color) : ansi_for(settings_.meta_val_color);
         auto kv = [&](int row, const std::string& label, const std::string& value) {
@@ -2122,7 +3217,7 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
     for (int i = 0; i < static_cast<int>(meta_rows.size()); ++i) {
         if (meta_rows[i].empty()) {
             meta_rows[i] = std::string(meta_w, ' ');
-        } else if (!has_track_ && i == 0) {
+        } else if (!showing_track() && i == 0) {
             meta_rows[i] = pad_right(meta_rows[i], meta_w);
         }
         // all other rows (kv data, visualizer) are already perfectly padded
@@ -2143,7 +3238,7 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
             lines_copy = lyrics_result_.lines;
             lyrics_status = lyrics_result_.message;
             lyrics_avail = !lines_copy.empty();
-        } else if (has_track_) {
+        } else if (showing_track()) {
             lyrics_status = "fetching lyrics ...";
         }
     }
@@ -2164,7 +3259,7 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
             std::chrono::steady_clock::now() - lyrics_status_shown_at_).count();
         bool show_caption = status_age < 10.0 && !lyrics_status.empty();
 
-        if (has_track_ && lyrics_w >= 6 && panel_h >= 3 && settings_.element_lyrics_placeholder_ball) {
+        if (showing_track() && lyrics_w >= 6 && panel_h >= 3 && settings_.element_lyrics_placeholder_ball) {
             // Fill the panel with the audio-reactive sphere instead of
             // leaving it blank — reuses `bars` (already computed for the
             // main spectrum strip above, same frame) rather than running
@@ -2285,8 +3380,9 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     int main_total_w = std::max(24, total_width - side_panel_w);
     int wave_w = main_total_w - 4;
 
-    double elapsed = has_track_ ? player_.poll_elapsed() : 0.0;
-    int active_cols = (total_sec_ > 0) ? static_cast<int>((elapsed / static_cast<double>(total_sec_)) * wave_w) : 0;
+    double elapsed = display_elapsed_sec();
+    const size_t shown_total_sec = display_total_sec();
+    int active_cols = (shown_total_sec > 0) ? static_cast<int>((elapsed / static_cast<double>(shown_total_sec)) * wave_w) : 0;
     active_cols = std::clamp(active_cols, 0, wave_w);
 
     int reveal_cols = wave_w;
@@ -2336,7 +3432,7 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     std::string generic_bar;
     if (!settings_.element_waveform) {
         int inner_w = std::max(0, wave_w - 2); // account for the '[' and ']'
-        int filled = (total_sec_ > 0) ? static_cast<int>((elapsed / static_cast<double>(total_sec_)) * inner_w) : 0;
+        int filled = (shown_total_sec > 0) ? static_cast<int>((elapsed / static_cast<double>(shown_total_sec)) * inner_w) : 0;
         filled = std::clamp(filled, 0, inner_w);
         generic_bar = "[" + color_played + std::string(filled, '#') + color_reset
                      + color_unplayed + std::string(inner_w - filled, '-') + color_reset + "]";
@@ -2354,7 +3450,11 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
         std::string bar = border_ansi + settings_.box_vertical + "\x1b[0m";
         return bar + " " + centered + " " + bar;
     };
-    std::string play_label = (has_track_ && player_.is_paused()) ? "PLAY" : (has_track_ ? "PAUSE" : "PLAY");
+    // Reflects whichever player actually owns playback: for Spotify that
+    // is the polled remote state, not player_'s (which is stopped).
+    bool paused_now = spotify_playing_ ? (spotify_status_.player.state != "playing")
+                                       : player_.is_paused();
+    std::string play_label = (showing_track() && !paused_now) ? "PAUSE" : "PLAY";
 
     std::vector<std::string> out;
     if (settings_.element_dummy_buttons) {
@@ -2381,7 +3481,9 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
         out.push_back(bar + " " + row2_content + " " + bar);
     }
 
-    int vol = player_.volume();
+    // Spotify's volume lives on the remote device, so it comes from the
+    // polled state rather than from mousiki's own output stage.
+    int vol = spotify_playing_ ? spotify_status_.player.volume : player_.volume();
     int vol_hashes = (vol * 20) / 100;
     // "#" (filled) matches the waveform's played color, "-" (empty)
     // matches its unplayed/remaining color -- color_played/color_unplayed
@@ -2422,7 +3524,7 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
         vol_tail = pad + vol_tail;
     }
 
-    std::string time_plain = "[ " + fmt_mmss(elapsed) + " ]" + settings_.box_horizontal + "[ " + fmt_mmss(static_cast<double>(total_sec_)) + " ]";
+    std::string time_plain = "[ " + fmt_mmss(elapsed) + " ]" + settings_.box_horizontal + "[ " + fmt_mmss(static_cast<double>(shown_total_sec)) + " ]";
     // Manual box-bottom construction (rather than the shared box_bottom()
     // helper) so the timestamp text can carry its own color: box_bottom()
     // measures/pads the footer as plain text, and embedding ANSI bytes
@@ -2442,13 +3544,17 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     return out;
 }
 std::vector<std::string> App::build_search_bar(int total_width) const {
-    std::string label = (list_source_ == ListSource::Online) ? "SEARCH ONLINE" : "SEARCH LOCAL";
+    std::string label = "SEARCH LOCAL";
+    if (list_source_ == ListSource::Online) label = "SEARCH ONLINE";
+    else if (list_source_ == ListSource::Spotify) label = "SEARCH SPOTIFY";
 
     std::string content;
     if (mode_ == Mode::Search) {
         content = "/" + search_buffer_ + "\u2588"; // block cursor
     } else if (list_source_ == ListSource::Online) {
         content = "/s:" + last_online_query_;
+    } else if (list_source_ == ListSource::Spotify) {
+        content = std::string("/") + kSpotifySearchPrefix + spotify_search_query_;
     } else {
         content = "/l:" + last_local_query_;
     }
@@ -2470,11 +3576,40 @@ std::vector<std::string> App::build_search_bar(int total_width) const {
 }
 
 std::vector<std::string> App::build_list_panel(int total_width, int height) const {
-    bool online = (list_source_ == ListSource::Online);
-    std::string label = online ? "ONLINE RESULTS"
-                                : "LOCAL AUDIO FILES (sort: " + std::string(sort_mode_name(local_sort_mode_)) + ")";
-    size_t total = online ? online_view_.size() : local_view_.size();
+    const bool online = (list_source_ == ListSource::Online);
+    const bool spotify = (list_source_ == ListSource::Spotify);
     int inner = total_width - 4;
+
+    // Spotify rows are built up front by level rather than inline in the
+    // loop below: five levels with different columns (a track has a
+    // duration, a playlist a count, an album a year) don't fit the
+    // two-branch shape the loop was written around.
+    std::vector<std::string> spotify_rows;
+    // False while the panel is showing an explanation instead of rows
+    // (not signed in, wrong backend) -- there is nothing to put a cursor
+    // on, and highlighting a sentence reads as a selectable item.
+    bool rows_selectable = true;
+    if (spotify) {
+        spotify_rows = build_spotify_list_rows(inner);
+        rows_selectable = (spotify_level_len() > 0);
+    }
+
+    std::string label;
+    if (spotify) {
+        label = "SPOTIFY";
+        if (spotify_level_ == SpotifyLevel::Home) {
+            label = rows_selectable ? "SPOTIFY HOME" : "SPOTIFY \u2014 NOT AVAILABLE";
+        } else if (!spotify_list_label_.empty()) {
+            label = "SPOTIFY \u00b7 " + spotify_list_label_;
+        }
+    } else if (online) {
+        label = "ONLINE RESULTS";
+    } else {
+        label = "LOCAL AUDIO FILES (sort: " + std::string(sort_mode_name(local_sort_mode_)) + ")";
+    }
+
+    size_t total = spotify ? spotify_rows.size()
+                           : (online ? online_view_.size() : local_view_.size());
     std::string border_ansi = ansi_for(settings_.border_color, false);
     std::string border_ansi_bottom = ansi_for(settings_.border_color_bottom, false);
 
@@ -2488,7 +3623,9 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
         int idx = scroll_ + row;
         std::string content;
         if (idx < static_cast<int>(total)) {
-            if (online) {
+            if (spotify) {
+                content = spotify_rows[idx];
+            } else if (online) {
                 const auto& r = online_view_[idx];
                 const int uploader_w = 18;
                 int title_w = std::max(5, inner - idx_w - 2 - 2 - uploader_w);
@@ -2528,7 +3665,7 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                         + t_dur;
             }
         }
-        bool sel = (idx == selected_) && idx < static_cast<int>(total);
+        bool sel = rows_selectable && (idx == selected_) && idx < static_cast<int>(total);
         // Was local-only ("!online && ..."), so a playing *online* track
         // never highlighted in its own results list at all -- fixed to
         // use the same source-aware identity match current_track_list_
@@ -2561,6 +3698,40 @@ std::vector<std::string> App::build_queue_panel(int total_width, int height) con
     std::string border_ansi_bottom = ansi_for(settings_.border_color_bottom, false);
     std::string bar = border_ansi + settings_.box_vertical + "\x1b[0m";
     std::vector<std::string> out;
+
+    // The right-hand panel changes meaning with the list source, because
+    // the two queues are different objects: in Local/Online it is
+    // mousiki's own queue_, drained by mousiki; in Spotify it mirrors the
+    // account's queue, shared live with the phone and desktop.
+    //
+    // Read-only on the Spotify side -- the Web API can append (POST
+    // /me/player/queue) but offers no reorder or remove, so a cursor
+    // there would imply edits that can't be made.
+    if (list_source_ == ListSource::Spotify) {
+        out.push_back(box_top("UP NEXT (spotify)", total_width, border_ansi));
+        const std::string queue_ansi = ansi_for(settings_.queue_color, false);
+        for (int row = 0; row < height; ++row) {
+            const int idx = row;
+            std::string content;
+            if (idx < static_cast<int>(spotify_queue_.size())) {
+                const auto& t = spotify_queue_[idx];
+                const int artist_w = std::min(16, std::max(0, inner / 3));
+                const int title_w = std::max(5, inner - 3 - 2 - 2 - artist_w);
+                content = pad_right(apply_font_map(std::to_string(idx + 1), settings_.font_map), 3)
+                        + settings_.list_separator + " "
+                        + pad_right(truncate_str(apply_font_map(t.name, settings_.font_map), title_w), title_w)
+                        + settings_.list_separator + " "
+                        + truncate_str(apply_font_map(t.artist, settings_.font_map), artist_w);
+            } else if (spotify_queue_.empty() && row == height / 2) {
+                const std::string text = apply_font_map("NOTHING UP NEXT", settings_.font_map);
+                content = std::string(std::max(0, (inner - display_width(text)) / 2), ' ') + text;
+            }
+            out.push_back(bar + " " + queue_ansi + pad_right(truncate_str(content, inner), inner) + "\x1b[0m " + bar);
+        }
+        out.push_back(box_bottom(total_width, "", border_ansi_bottom));
+        return out;
+    }
+
     std::string title = queue_focus_ ? "QUEUE (focused)" : "QUEUE";
     out.push_back(box_top(title, total_width, border_ansi));
 
@@ -2908,6 +4079,8 @@ void App::build_cheatsheet_screen(std::ostringstream& frame, int W) const {
     static const std::pair<const char*, const char*> rows[] = {
         {"HKeySearch",                      "Search local folder"},
         {"HKeySearchOnline",                "Search online (YouTube)"},
+        {"HKeySpotify",                     "Spotify home (playlists, daily mix, top tracks)"},
+        {"HKeySearchSpotify",               "Search Spotify catalogue"},
         {"HKeyDownloadStream",              "Download stream to 1st local path"},
         {"HKeyTogglePlayPause",             "Play / pause"},
         {"HKeyPlayNextSong",                "Play next in list/queue"},
@@ -3523,9 +4696,13 @@ int App::run() {
             log_event("restored previous session");
         }
     }
+    // Cold start used to immediately play local_view_[0] -- whichever
+    // file happened to sort first, chosen by nobody. Now the cursor is
+    // just parked there and nothing plays until the user picks something
+    // (see Settings::autoplay_on_start).
     if (!restored && !local_view_.empty()) {
         selected_ = 0;
-        start_local_track(local_view_[0]);
+        if (settings_.autoplay_on_start) start_local_track(local_view_[0]);
     }
 
     TerminalIO term;
@@ -3541,6 +4718,10 @@ int App::run() {
         poll_pending_load();
         poll_pending_waveform();
         poll_pending_bulk_add();
+        poll_pending_spotify_fetch();
+        poll_pending_spotify_status();
+        poll_pending_spotify_auth();
+        poll_pending_spotify_messages();
         maybe_autosave();
 
         auto now = std::chrono::steady_clock::now();
@@ -3554,7 +4735,12 @@ int App::run() {
         }
         // Disk only spins while something is actually playing — frozen
         // when idle or paused, per instruction.
-        if (has_track_ && !player_.is_paused()) {
+        // The disk is time-driven rather than audio-driven, so it keeps
+        // spinning for a Spotify track even though the audio-fed elements
+        // (visualizer, waveform) are flat.
+        const bool spinning = spotify_playing_ ? (spotify_status_.player.state == "playing")
+                                               : (has_track_ && !player_.is_paused());
+        if (spinning) {
             angle_ = std::fmod(angle_ + kAngularVelocity * settings_.disk_rotation_speed * dt,
                                2.0 * 3.14159265358979323846);
         }
@@ -3584,6 +4770,16 @@ int App::run() {
     if (search_thread_.joinable()) search_thread_.join();
     if (device_thread_.joinable()) device_thread_.join();
     if (bulk_add_thread_.joinable()) bulk_add_thread_.join();
+    // Signalled first, then joined -- the poll loop sleeps in 100ms
+    // slices so this doesn't block for a whole interval on quit.
+    stop_spotify_poll();
+    stop_spotify_cmd_worker();
+    if (spotify_thread_.joinable()) spotify_thread_.join();
+    // Detached, not joined: interactive_login() blocks on a loopback
+    // socket for up to five minutes, and quitting must not wait on a
+    // browser tab the user already abandoned. The leak lasts the few
+    // remaining milliseconds of process life.
+    if (spotify_auth_thread_.joinable()) spotify_auth_thread_.detach();
     std::cout << "\nbye.\n";
     return 0;
 }

@@ -130,7 +130,7 @@ DiskArt::DiskArt() {
     }
 }
 
-std::vector<std::string> DiskArt::frame(double angle) const {
+std::vector<std::string> DiskArt::frame_dots(double angle) const {
     const int pixelWidth = width_ * 2;
     const int pixelHeight = height_ * 4;
 
@@ -165,6 +165,148 @@ std::vector<std::string> DiskArt::frame(double angle) const {
                     int x = col * 2 + dx;
                     int y = row * 4 + dy;
                     if (x < pixelWidth && y < pixelHeight) dots[dy][dx] = bitmap[y][x];
+                }
+            }
+            line += encodeBraille(dots);
+        }
+        result.push_back(std::move(line));
+    }
+    return result;
+}
+
+std::vector<std::string> DiskArt::frame(double angle) const {
+    return art_.empty() ? frame_dots(angle) : frame_art(angle);
+}
+
+void DiskArt::clear_album_art() {
+    art_.clear();
+}
+
+void DiskArt::set_album_art(const AlbumArtImage& img) {
+    if (!img.valid()) { clear_album_art(); return; }
+
+    const int pw = width_ * 2;
+    const int ph = height_ * 4;
+    if (pw <= 0 || ph <= 0) { clear_album_art(); return; }
+
+    const double cx = (pw - 1) / 2.0;
+    const double cy = (ph - 1) / 2.0;
+    const double radius = std::min(pw, ph) / 2.0 - 0.5;
+    // The spindle hole, sized as a fraction of the disk so it survives
+    // any future resize. It earns its place: without it a dark cover
+    // renders as one featureless blob and stops reading as a record at
+    // all — the hole is the feature that says "this thing is spinning".
+    const double hole = radius * 0.17;
+    const double r2 = radius * radius;
+    const double h2 = hole * hole;
+
+    auto masked = [&](int x, int y) {
+        const double dx = x - cx, dy = y - cy;
+        const double d2 = dx * dx + dy * dy;
+        return d2 > r2 || d2 < h2;
+    };
+
+    // --- resample the cover onto the dot grid ------------------------
+    // Nearest-neighbour is enough here: album_art.cpp already asked
+    // ffmpeg for exactly art_resolution() pixels with a box filter, so
+    // in practice this is a 1:1 copy. The general form only matters if
+    // a cached frame from an older build comes back at another size.
+    std::vector<double> lum(static_cast<size_t>(pw) * static_cast<size_t>(ph), 0.0);
+    for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+            const int sx = std::clamp(static_cast<int>((x + 0.5) / pw * img.size), 0, img.size - 1);
+            const int sy = std::clamp(static_cast<int>((y + 0.5) / ph * img.size), 0, img.size - 1);
+            lum[static_cast<size_t>(y) * pw + x] =
+                static_cast<double>(img.gray[static_cast<size_t>(sy) * img.size + sx]);
+        }
+    }
+
+    // --- auto-levels, over the visible disk only ---------------------
+    // Album covers are mastered for a backlit screen, not for a 1-bit
+    // grid. A dark sleeve lands almost entirely below any fixed
+    // threshold and dithers to nothing; a blown-out one dithers to a
+    // solid blob. Stretching the 2nd-98th percentile of what is
+    // actually inside the circle is what keeps both legible — and the
+    // percentiles, rather than plain min/max, are what stop one
+    // specular highlight or one black corner from eating the range.
+    int hist[256] = {0};
+    int inside = 0;
+    for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+            if (masked(x, y)) continue;
+            ++hist[static_cast<int>(lum[static_cast<size_t>(y) * pw + x])];
+            ++inside;
+        }
+    }
+    double lo = 0.0, hi = 255.0;
+    if (inside > 0) {
+        const int lo_target = std::max(1, inside * 2 / 100);
+        const int hi_target = std::max(1, inside - inside * 2 / 100);
+        int acc = 0;
+        for (int i = 0; i < 256; ++i) { acc += hist[i]; if (acc >= lo_target) { lo = i; break; } }
+        acc = 0;
+        for (int i = 0; i < 256; ++i) { acc += hist[i]; if (acc >= hi_target) { hi = i; break; } }
+    }
+    // A near-flat cover (a solid-colour sleeve) has no range to stretch;
+    // amplifying its noise by 30x would turn it into static.
+    if (hi - lo < 8.0) { lo = 0.0; hi = 255.0; }
+    for (double& v : lum) v = std::clamp((v - lo) / (hi - lo), 0.0, 1.0) * 255.0;
+
+    // --- Floyd-Steinberg, masked to the disk -------------------------
+    art_.assign(static_cast<size_t>(pw) * static_cast<size_t>(ph), 0);
+    for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+            const size_t i = static_cast<size_t>(y) * pw + x;
+            if (masked(x, y)) continue;  // art_ is already 0 here; dropped error is fine
+            const double old_v = lum[i];
+            const double new_v = old_v >= 128.0 ? 255.0 : 0.0;
+            art_[i] = new_v > 0.0 ? 1 : 0;
+            const double err = old_v - new_v;
+            auto spill = [&](int ox, int oy, double w) {
+                const int nx = x + ox, ny = y + oy;
+                if (nx < 0 || nx >= pw || ny < 0 || ny >= ph) return;
+                lum[static_cast<size_t>(ny) * pw + nx] += err * w;
+            };
+            spill(1, 0, 7.0 / 16.0);
+            spill(-1, 1, 3.0 / 16.0);
+            spill(0, 1, 5.0 / 16.0);
+            spill(1, 1, 1.0 / 16.0);
+        }
+    }
+}
+
+std::vector<std::string> DiskArt::frame_art(double angle) const {
+    const int pw = width_ * 2;
+    const int ph = height_ * 4;
+
+    // Inverse mapping, unlike frame_dots(): that one pushes each source
+    // dot to a rounded destination, which is fine for sparse line art
+    // but tears holes through a ~50%-dense dithered cover — two source
+    // dots round onto the same destination and the cell they vacated
+    // stays empty, so the disk visibly sparkles as it turns. Pulling
+    // instead (one source lookup per destination dot) can neither
+    // collide nor leave a gap.
+    const double cx = (pw - 1) / 2.0;
+    const double cy = (ph - 1) / 2.0;
+    const double c = std::cos(-angle);
+    const double s = std::sin(-angle);
+
+    std::vector<std::string> result;
+    result.reserve(height_);
+    for (int row = 0; row < height_; ++row) {
+        std::string line;
+        for (int col = 0; col < width_; ++col) {
+            bool dots[4][2]{};
+            for (int dy = 0; dy < 4; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int x = col * 2 + dx;
+                    const int y = row * 4 + dy;
+                    if (x >= pw || y >= ph) continue;
+                    const double ox = x - cx, oy = y - cy;
+                    const int sx = static_cast<int>(std::lround(ox * c - oy * s + cx));
+                    const int sy = static_cast<int>(std::lround(ox * s + oy * c + cy));
+                    if (sx < 0 || sx >= pw || sy < 0 || sy >= ph) continue;
+                    dots[dy][dx] = art_[static_cast<size_t>(sy) * pw + sx] != 0;
                 }
             }
             line += encodeBraille(dots);

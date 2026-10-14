@@ -126,6 +126,35 @@ bool SpotifyWebClient::get_all_pages(const std::string& path_base, int limit,
     return true;
 }
 
+// Picks which copy of an album cover to download from the `images`
+// array. Spotify documents these as ordered widest-first (640, 300, 64)
+// but guarantees nothing, so this scans rather than indexing. The disk
+// renders at 60x60 dots, which the 300px copy feeds with detail to
+// spare at a fraction of the 640's bytes -- so: the smallest image still
+// at or above the target, falling back to the largest of whatever is
+// left when every copy is smaller than that.
+static std::string pick_album_art(const tinyjson::Value& album) {
+    const auto* images = album.find("images");
+    if (!images || images->type != tinyjson::Type::Array) return "";
+
+    constexpr double kPreferredPx = 300.0;
+    std::string best, fallback;
+    double best_w = 0.0, fallback_w = -1.0;
+
+    for (const auto& im : images->arr) {
+        const auto* u = im.find("url");
+        if (!u) continue;
+        const std::string url = u->as_string();
+        if (url.empty()) continue;
+        const auto* w_val = im.find("width");
+        const double w = w_val ? w_val->as_number(0.0) : 0.0;
+
+        if (w >= kPreferredPx && (best.empty() || w < best_w)) { best = url; best_w = w; }
+        if (w > fallback_w) { fallback = url; fallback_w = w; }
+    }
+    return best.empty() ? fallback : best;
+}
+
 // ---------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------
@@ -168,6 +197,7 @@ bool SpotifyWebClient::status(SpotifyStatus& out, std::string* error_out) {
         if (const auto* d = item->find("duration_ms")) out.player.duration_ms = static_cast<long long>(d->as_number(0));
         if (const auto* al = item->find("album")) {
             if (const auto* an = al->find("name")) out.track.album = an->as_string();
+            out.track.art_url = pick_album_art(*al);
         }
         // Spotify returns every credited artist; join them the way the
         // extension's artistsToArtist() helper did.
@@ -431,6 +461,7 @@ static bool parse_track(const tinyjson::Value& t, SpotifyTrack& tr) {
     if (const auto* x = t.find("duration_ms")) tr.duration_ms = static_cast<long long>(x->as_number(0));
     if (const auto* al = t.find("album")) {
         if (const auto* x = al->find("name")) tr.album = x->as_string();
+        tr.art_url = pick_album_art(*al);
     }
     if (const auto* arts = t.find("artists")) tr.artist = join_artist_names(*arts);
     // Playlists can hold podcast episodes, and local-only files and
@@ -491,7 +522,7 @@ bool SpotifyWebClient::playlist_tracks(const SpotifyPlaylist& pl, std::vector<Sp
     // entries and the unfiltered payload is enormous.
     const std::string base =
         "playlists/" + pl.id + "/items?fields=" +
-        http_url_encode("items(item(id,name,uri,duration_ms,album(name),artists(name))),limit,offset,total");
+        http_url_encode("items(item(id,name,uri,duration_ms,album(name,images),artists(name))),limit,offset,total");
 
     std::vector<std::string> pages;
     if (!get_all_pages(base, 100, pages, error_out)) return false;
@@ -508,7 +539,7 @@ bool SpotifyWebClient::saved_tracks(std::vector<SpotifyTrack>& out, std::string*
     out.clear();
     const std::string base =
         "me/tracks?fields=" +
-        http_url_encode("items(track(id,name,uri,duration_ms,album(name),artists(name))),limit,offset,total");
+        http_url_encode("items(track(id,name,uri,duration_ms,album(name,images),artists(name))),limit,offset,total");
 
     std::vector<std::string> pages;
     if (!get_all_pages(base, 50, pages, error_out)) return false;

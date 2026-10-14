@@ -493,6 +493,7 @@ static Settings load_from_config(const fs::path& path) {
             {"ElimentLyrics", "Eliment_lyrics"}, {"LyricsPlaceholderBall", "Eliment_lyrics_placeholder_ball"},
             {"Visualizer", "Eliment_visualizer"},
             {"VisualizerFluidity", "visualizer_fluidity"}, {"DiskRotationSpeed", "disk_rotation_speed"},
+            {"DiskAlbumArt", "disk_album_art"},
             {"VisualizerDegradationSpeed", "visualizer_degradation_speed"}, {"VisualizerViscosity", "visualizer_viscosity"},
             {"LyricsAlignment", "lyrics_alignment"}, {"LyricsAnimation", "lyrics_animation"},
             {"UpperLeftCorner", "upper_left_corner"}, {"UpperRightCorner", "upper_right_corner"},
@@ -589,6 +590,7 @@ static Settings load_from_config(const fs::path& path) {
         if (key == "disk_color_end") { if (!value.empty()) s.disk_color_end = normalize_color_value(value); continue; }
         if (key == "disk_color_gradient") { s.disk_color_gradient = parse_bool(value); continue; }
         if (key == "disk_rotation_speed") { try { s.disk_rotation_speed = std::clamp(std::stod(value), 0.01, 1.00); } catch (...) {} continue; }
+        if (key == "disk_album_art") { s.disk_album_art = parse_bool(value); continue; }
         if (key == "border_color") { if (!value.empty()) s.border_color = normalize_color_value(value); continue; }
         if (key == "border_color_bottom") { if (!value.empty()) s.border_color_bottom = normalize_color_value(value); continue; }
         if (key == "active_line_color") { if (!value.empty()) s.active_line_color = normalize_color_value(value); continue; }
@@ -863,6 +865,7 @@ void save_settings(const Settings& s) {
     out << "VisualizerFluidity=" << s.visualizer_fluidity << "\n## 1 to 10\n";
     out << "WaveformStyle=" << (s.waveform_smooth ? "smooth" : "raw") << "\n## raw , smooth\n";
     out << "DiskRotationSpeed=" << s.disk_rotation_speed << "\n## 0.01x to 1.00x\n";
+    out << "DiskAlbumArt=" << tf(s.disk_album_art) << "\n## true , false -- spin the playing album's cover instead of the built-in vinyl (Spotify Web API only)\n";
     out << "PlaybackMode=" << play_mode_name(s.play_mode) << "\n## list , loop , shuffle , stop , repeat queue\n";
     out << "VisualizerDegradationSpeed=" << s.visualizer_degradation_speed << "\n## 1 to 10\n";
     out << "VisualizerViscosity=" << s.visualizer_viscosity << "\n## 1 to 10\n";

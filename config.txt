@@ -63,6 +63,8 @@ WaveformStyle=raw
 ## raw , smooth
 DiskRotationSpeed=0.25
 ## 0.01x to 1.00x
+DiskAlbumArt=true
+## true , false -- spin the playing album's cover instead of the built-in vinyl (Spotify Web API only)
 PlaybackMode=list
 ## list , loop , shuffle , stop , repeat queue
 VisualizerDegradationSpeed=10

@@ -25,6 +25,12 @@ struct SpotifyTrackInfo {
     std::string artist;
     std::string album;
     std::string uri;          // spotify:track:... (empty on some backends)
+
+    // Cover art for `album`, as a CDN URL. Only the Web API backend
+    // fills this in -- the MPRIS/AppleScript backends drive the desktop
+    // app and never see the catalogue metadata it came from. Empty means
+    // "no art", which the disk panel reads as "keep showing the vinyl".
+    std::string art_url;
 };
 
 struct SpotifyStatus {
@@ -82,6 +88,12 @@ struct SpotifyTrack {
     std::string artist;
     std::string album;
     long long duration_ms = 0;
+
+    // Album cover URL, same as SpotifyTrackInfo::art_url. Carried on the
+    // list rows too so pressing Enter can put the right cover on the
+    // disk immediately, instead of the panel sitting on the previous
+    // track's artwork until the next status poll lands.
+    std::string art_url;
 
     // "Artist - Title", the search string mousiki hands to yt-dlp when
     // it needs actual decodable audio for this track.

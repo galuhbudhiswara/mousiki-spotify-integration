@@ -779,6 +779,9 @@ void App::poll_pending_load() {
     current_is_local_ = pl.is_local;
     current_video_id_ = pl.video_id;
     has_track_ = true;
+    // A local file is in the speakers now, so a Spotify cover left
+    // spinning would be advertising the wrong song.
+    set_disk_album_art("", "");
     player_.clear_finished(); // see clear_finished()'s comment — closes the race that caused the double-skip bug
     waveform_envelope_.clear();
     waveform_ready_ = false;
@@ -1288,8 +1291,13 @@ void App::spotify_play_track(const SpotifyTrack& t) {
     spotify_status_.track.artist = t.artist;
     spotify_status_.track.album = t.album;
     spotify_status_.track.uri = t.uri;
+    spotify_status_.track.art_url = t.art_url;
     spotify_status_at_ = std::chrono::steady_clock::now();
     apply_spotify_metadata();
+    // From the list row rather than the poll, so the disk turns over at
+    // the same moment the rest of the panel does instead of a poll
+    // interval later.
+    set_disk_album_art(t.art_url, t.id);
 
     // Lyrics work here, off better tags than the yt-dlp path's: these are
     // Spotify's own rather than a guess from an uploader's video title.
@@ -1559,6 +1567,7 @@ void App::poll_pending_spotify_status() {
         if (spotify_playing_) {
             spotify_playing_ = false;
             spotify_lyrics_uri_.clear(); // coming back to this track later should refetch
+            set_disk_album_art("", "");  // nothing is playing: back to the vinyl
             status_line_ = "spotify stopped";
         }
         return;
@@ -1585,12 +1594,83 @@ void App::poll_pending_spotify_status() {
             last_lyrics_status_.clear();
             launch_lyrics_fetch(spotify_status_.track.name, spotify_status_.track.artist, fs::path());
         }
+        // The uri is "spotify:track:<id>"; the id alone is the cache key.
+        set_disk_album_art(spotify_status_.track.art_url,
+                           spotify_status_.track.uri.substr(spotify_status_.track.uri.rfind(':') + 1));
         ConsoleLog::instance().log_basic("  [BRANCH !=] masuk cabang, lyr=" + (spotify_lyrics_uri_.empty()?std::string("(none)"):spotify_lyrics_uri_.substr(spotify_lyrics_uri_.size()-6)) + " st=" + (spotify_status_.track.uri.empty()?std::string("(none)"):spotify_status_.track.uri.substr(spotify_status_.track.uri.size()-6)));
         log_event("spotify: now playing " + spotify_status_.display());
     } else if (spotify_playing_) {
         // Same track: the volume/device/state rows can still have moved.
         apply_spotify_metadata();
     }
+}
+
+// ---------------------------------------------------------------------
+// Album art on the disk
+// ---------------------------------------------------------------------
+
+// Points the disk at `url`'s cover. Returns immediately: the download
+// and the ffmpeg decode happen on a detached thread (same shape as
+// launch_lyrics_fetch), and poll_pending_album_art() installs the result
+// on the next frame.
+//
+// `cache_key` is the Spotify track id, which is what the decoded frame
+// is filed under on disk -- so coming back to a song later costs no
+// network and the cover appears on the very first frame.
+void App::set_disk_album_art(const std::string& url, const std::string& cache_key) {
+    if (!settings_.disk_album_art) {
+        // Turned off mid-session, with a cover still spinning.
+        if (!disk_art_url_.empty()) {
+            disk_art_url_.clear();
+            disk_.clear_album_art();
+        }
+        return;
+    }
+    // Already showing this cover, or already fetching it. Track changes
+    // come in through both spotify_play_track() and the status poll, and
+    // the poll re-reports the same track every few seconds forever.
+    if (url == disk_art_url_) return;
+
+    disk_art_url_ = url;
+    if (url.empty()) { disk_.clear_album_art(); return; }
+
+    const int resolution = disk_.art_resolution();
+    const fs::path cache_dir = cache_.cache_dir();
+    std::thread([this, url, cache_key, resolution, cache_dir]() {
+        AlbumArtImage img;
+        std::string err;
+        if (!fetch_album_art(url, cache_key, cache_dir, resolution, img, &err)) {
+            // Logged, not surfaced in the status line: a missing cover
+            // is cosmetic, and the line is where playback errors go.
+            ConsoleLog::instance().log_basic("spotify: " + err);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(album_art_mutex_);
+            pending_album_art_ = std::move(img);
+            pending_album_art_url_ = url;
+        }
+        album_art_ready_ = true;
+    }).detach();
+}
+
+void App::poll_pending_album_art() {
+    if (!album_art_ready_.load()) return;
+
+    AlbumArtImage img;
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lk(album_art_mutex_);
+        img = std::move(pending_album_art_);
+        url = std::move(pending_album_art_url_);
+        pending_album_art_ = AlbumArtImage{};
+        pending_album_art_url_.clear();
+        album_art_ready_ = false;
+    }
+
+    // Skipped past while this was downloading.
+    if (url != disk_art_url_) return;
+    disk_.set_album_art(img);
 }
 
 // ---------------------------------------------------------------------
@@ -4720,6 +4800,7 @@ int App::run() {
         poll_pending_bulk_add();
         poll_pending_spotify_fetch();
         poll_pending_spotify_status();
+        poll_pending_album_art();
         poll_pending_spotify_auth();
         poll_pending_spotify_messages();
         maybe_autosave();

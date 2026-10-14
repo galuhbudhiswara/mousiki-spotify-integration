@@ -35,6 +35,11 @@ struct Settings {
     std::string disk_color_end = "34"; // empty = solid disk_color, no gradient
     bool disk_color_gradient = true;    // true = use disk_color_end as a gradient stop, false = solid/"generic" disk_color only
     double disk_rotation_speed = 1.0;   // multiplier on the reference angular velocity, range 0.01x-1.00x
+    // Spin the cover of whatever Spotify is playing instead of the
+    // built-in vinyl. Spotify's Web API backend only -- the MPRIS and
+    // AppleScript backends don't report cover art (see
+    // SpotifyTrackInfo::art_url), so there it simply never engages.
+    bool disk_album_art = true;
 
     // --- border / separator characters (from config.txt) ---------------
     std::string box_upper_left = "\u256d";   // ╭

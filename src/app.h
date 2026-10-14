@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "album_art.h"
 #include "disk_art.h"
 #include "fft_visualizer.h"
 #include "local_source.h"
@@ -457,6 +458,24 @@ private:
     // the eight sections don't need eight near-identical launchers.
     void launch_spotify_fetch(std::function<void(SpotifyFetch&)> work);
     void poll_pending_spotify_fetch();
+
+    // --- album art on the disk ------------------------------------------
+    // The cover of whatever is playing, downloaded and decoded off the
+    // render thread (one HTTP round-trip plus an ffmpeg call -- see
+    // fetch_album_art), then handed to disk_ on the main thread because
+    // DiskArt is not synchronized.
+    //
+    // disk_art_url_ is the cover that SHOULD be on screen. A finished
+    // download whose url no longer matches it belongs to a track the
+    // user has already skipped past, and gets dropped: a cover for a
+    // song that stopped playing is worse than no cover at all.
+    std::mutex album_art_mutex_;
+    std::atomic<bool> album_art_ready_{false};
+    AlbumArtImage pending_album_art_;
+    std::string pending_album_art_url_;
+    std::string disk_art_url_;
+    void set_disk_album_art(const std::string& url, const std::string& cache_key);
+    void poll_pending_album_art();
 
     // --- Spotify now-playing poll ---------------------------------------
     // A heartbeat for as long as the Spotify view/playback is active,

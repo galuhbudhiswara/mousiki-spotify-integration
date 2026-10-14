@@ -191,6 +191,42 @@ private:
         return true;
     }
 
+    // Reads exactly four hex digits at `at` into `cp`. Returns false
+    // (leaving the input position untouched) on anything malformed.
+    bool parse_hex4(size_t at, unsigned& cp) const {
+        if (at + 3 >= s_.size()) return false;
+        unsigned v = 0;
+        for (size_t k = at; k < at + 4; ++k) {
+            char c = s_[k];
+            unsigned d;
+            if (c >= '0' && c <= '9') d = unsigned(c - '0');
+            else if (c >= 'a' && c <= 'f') d = unsigned(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') d = unsigned(c - 'A' + 10);
+            else return false;
+            v = (v << 4) | d;
+        }
+        cp = v;
+        return true;
+    }
+
+    static void append_utf8(std::string& out, unsigned cp) {
+        if (cp < 0x80) {
+            out += char(cp);
+        } else if (cp < 0x800) {
+            out += char(0xC0 | (cp >> 6));
+            out += char(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += char(0xE0 | (cp >> 12));
+            out += char(0x80 | ((cp >> 6) & 0x3F));
+            out += char(0x80 | (cp & 0x3F));
+        } else {
+            out += char(0xF0 | (cp >> 18));
+            out += char(0x80 | ((cp >> 12) & 0x3F));
+            out += char(0x80 | ((cp >> 6) & 0x3F));
+            out += char(0x80 | (cp & 0x3F));
+        }
+    }
+
     bool parse_raw_string(std::string& out) {
         if (peek() != '"') return false;
         ++i_;
@@ -206,6 +242,34 @@ private:
                     case '"': out += '"'; break;
                     case '\\': out += '\\'; break;
                     case '/': out += '/'; break;
+                    case 'b': out += '\b'; break;
+                    case 'f': out += '\f'; break;
+                    case 'u': {
+                        // \uXXXX -> UTF-8. Needed because track/artist
+                        // names routinely contain non-ASCII; without this
+                        // the default case below swallowed the escape and
+                        // emitted a literal "u00e9", which then corrupted
+                        // both the display name and any search/lyrics
+                        // lookup built from it.
+                        unsigned cp = 0;
+                        if (!parse_hex4(i_ + 2, cp)) { out += n; i_ += 2; continue; }
+                        i_ += 6;
+                        // A high surrogate must be paired with the low
+                        // surrogate that follows it to form one code point.
+                        if (cp >= 0xD800 && cp <= 0xDBFF && i_ + 1 < s_.size() &&
+                            s_[i_] == '\\' && s_[i_ + 1] == 'u') {
+                            unsigned lo = 0;
+                            if (parse_hex4(i_ + 2, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                i_ += 6;
+                            }
+                        }
+                        // An unpaired surrogate isn't encodable; emit
+                        // U+FFFD rather than invalid UTF-8.
+                        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+                        append_utf8(out, cp);
+                        continue;
+                    }
                     default: out += n; break;
                 }
                 i_ += 2;

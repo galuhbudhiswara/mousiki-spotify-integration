@@ -40,6 +40,11 @@ struct Settings {
     // AppleScript backends don't report cover art (see
     // SpotifyTrackInfo::art_url), so there it simply never engages.
     bool disk_album_art = true;
+    // Paint that cover in its own colours instead of the ColorDiskTop/
+    // ColorDiskBottom gradient. Separate from disk_album_art on purpose:
+    // showing the artwork and overriding a colour the user deliberately
+    // picked are two different consents.
+    bool disk_album_color = true;
 
     // --- border / separator characters (from config.txt) ---------------
     std::string box_upper_left = "\u256d";   // ╭

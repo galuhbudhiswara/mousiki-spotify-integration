@@ -57,22 +57,35 @@ bool fetch_album_art(const std::string& url,
     if (url.empty()) return fail("this track has no cover art");
     if (size <= 0) return fail("bad cover art target size");
 
-    const size_t expected = static_cast<size_t>(size) * static_cast<size_t>(size);
+    const size_t pixels = static_cast<size_t>(size) * static_cast<size_t>(size);
+    const size_t expected = pixels * 3;   // rgb24
 
     std::error_code ec;
     const fs::path dir = cache_dir / "art";
     fs::create_directories(dir, ec);
 
     const std::string stem = safe_key(cache_key.empty() ? url : cache_key);
-    const fs::path gray_path = dir / (stem + "_" + std::to_string(size) + ".gray");
+    const fs::path rgb_path = dir / (stem + "_" + std::to_string(size) + ".rgb");
 
     // Cache hit. The size check doubles as the validity check -- a run
     // killed mid-decode leaves a short file, and a short file is the one
     // failure mode that would otherwise be cached forever.
-    std::string cached;
-    if (read_file(gray_path, cached) && cached.size() == expected) {
+    // Luma from the same BT.601 weights ffmpeg's own rgb->gray conversion
+    // uses, so swapping to a single decode didn't shift which pixels land
+    // either side of the dither threshold.
+    auto fill = [&](const std::string& raw) {
         out.size = size;
-        out.gray.assign(cached.begin(), cached.end());
+        out.rgb.assign(raw.begin(), raw.end());
+        out.gray.resize(pixels);
+        for (size_t i = 0; i < pixels; ++i) {
+            const double r = out.rgb[i * 3], g = out.rgb[i * 3 + 1], b = out.rgb[i * 3 + 2];
+            out.gray[i] = static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+        }
+    };
+
+    std::string cached;
+    if (read_file(rgb_path, cached) && cached.size() == expected) {
+        fill(cached);
         return true;
     }
 
@@ -95,19 +108,18 @@ bool fetch_album_art(const std::string& url,
     const std::string cmd =
         "ffmpeg -nostdin -v error -y -i " + shell_quote(src_path.string()) +
         " -an -frames:v 1 -vf " + shell_quote(scale) +
-        " -pix_fmt gray -f rawvideo " + shell_quote(gray_path.string());
+        " -pix_fmt rgb24 -f rawvideo " + shell_quote(rgb_path.string());
 
     ProcResult r = run_capture(cmd, true);
     fs::remove(src_path, ec);
 
     std::string raw;
-    if (!r.ok() || !read_file(gray_path, raw) || raw.size() != expected) {
-        fs::remove(gray_path, ec); // never leave a truncated frame behind to be "cached"
+    if (!r.ok() || !read_file(rgb_path, raw) || raw.size() != expected) {
+        fs::remove(rgb_path, ec); // never leave a truncated frame behind to be "cached"
         return fail("ffmpeg could not decode the cover art");
     }
 
-    out.size = size;
-    out.gray.assign(raw.begin(), raw.end());
+    fill(raw);
     return true;
 }
 

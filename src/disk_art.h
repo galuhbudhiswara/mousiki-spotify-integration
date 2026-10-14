@@ -8,6 +8,16 @@
 
 namespace muisc {
 
+// One Braille cell's colour. A cell is the smallest thing a terminal can
+// colour -- it holds 2x4 dots but only one foreground colour -- so this
+// is the real resolution of the disk's colour, a quarter of its shape
+// resolution in each axis.
+struct DiskRgb {
+    unsigned char r = 0, g = 0, b = 0;
+    bool operator==(const DiskRgb& o) const { return r == o.r && g == o.g && b == o.b; }
+    bool operator!=(const DiskRgb& o) const { return !(*this == o); }
+};
+
 // Renders the rotating Braille-dot "disk" seen in the mockup. This is a
 // direct port of the rotation algorithm supplied in beta-ui.txt (decode
 // the artwork into individual dots once, then rotate the dot cloud around
@@ -24,7 +34,15 @@ public:
 
     // One rotated frame at `angle_radians`, as printable lines (no trailing
     // newlines). Always `height()` lines of `width()` Braille cells each.
-    std::vector<std::string> frame(double angle_radians) const;
+    //
+    // Pass `out_cell_colors` to also get the cover's own colour per cell,
+    // sampled from the same rotated position the dots came from so the
+    // colour turns with the art. Filled to height() rows of width()
+    // entries, or cleared when the built-in vinyl is showing -- line art
+    // has no colour of its own, and the caller should keep using the
+    // configured gradient there.
+    std::vector<std::string> frame(double angle_radians,
+                                   std::vector<std::vector<DiskRgb>>* out_cell_colors = nullptr) const;
 
     // Replaces the vinyl with `img`, dithered down to the 1-bit grid
     // Braille can actually show and masked into the same circular
@@ -51,10 +69,11 @@ private:
     struct Dot { double x; double y; };
 
     std::vector<std::string> frame_dots(double angle) const;
-    std::vector<std::string> frame_art(double angle) const;
+    std::vector<std::string> frame_art(double angle, std::vector<std::vector<DiskRgb>>* colors) const;
 
-    std::vector<Dot> dots_;      // the built-in vinyl, as a sparse dot cloud
-    std::vector<uint8_t> art_;   // (width_*2) x (height_*4), 1 = dot; empty = show the vinyl
+    std::vector<Dot> dots_;         // the built-in vinyl, as a sparse dot cloud
+    std::vector<uint8_t> art_;      // (width_*2) x (height_*4), 1 = dot; empty = show the vinyl
+    std::vector<uint8_t> art_rgb_;  // same grid, 3 bytes per dot position; parallel to art_
     int width_ = 0;
     int height_ = 0;
 };

@@ -99,6 +99,58 @@ std::vector<std::string> split_lines(const std::string& source) {
     return lines;
 }
 
+// Pulls a sampled cover colour into a band a terminal can actually show
+// on a dark background: saturation and lightness both get floors, the
+// hue is left alone.
+//
+// The s < 0.12 escape hatch is load-bearing. A white t-shirt or a grey
+// slab carries a meaningless residual hue, and dragging that up to the
+// floor invents a colour the sleeve does not contain -- DAMN.'s white
+// shirt came out lavender before this was here.
+DiskRgb boost_color(double r, double g, double b) {
+    r /= 255.0; g /= 255.0; b /= 255.0;
+
+    const double mx = std::max({r, g, b});
+    const double mn = std::min({r, g, b});
+    double h = 0.0;
+    const double l = (mx + mn) / 2.0;
+    double sat = 0.0;
+    if (mx > mn) {
+        const double d = mx - mn;
+        sat = l > 0.5 ? d / (2.0 - mx - mn) : d / (mx + mn);
+        if (mx == r)      h = (g - b) / d + (g < b ? 6.0 : 0.0);
+        else if (mx == g) h = (b - r) / d + 2.0;
+        else              h = (r - g) / d + 4.0;
+        h /= 6.0;
+    }
+
+    constexpr double kSatMul = 1.6, kSatFloor = 0.35, kSatCeil = 1.0;
+    constexpr double kLightFloor = 0.42, kLightCeil = 0.80;
+    sat = sat < 0.12 ? sat * 0.6 : std::clamp(sat * kSatMul, kSatFloor, kSatCeil);
+    const double lo = std::clamp(l, kLightFloor, kLightCeil);
+
+    auto hue2rgb = [](double p, double q, double t) {
+        if (t < 0.0) t += 1.0;
+        if (t > 1.0) t -= 1.0;
+        if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+        if (t < 1.0 / 2.0) return q;
+        if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        return p;
+    };
+    double orr = lo, og = lo, ob = lo;
+    if (sat > 0.0) {
+        const double q = lo < 0.5 ? lo * (1.0 + sat) : lo + sat - lo * sat;
+        const double p = 2.0 * lo - q;
+        orr = hue2rgb(p, q, h + 1.0 / 3.0);
+        og  = hue2rgb(p, q, h);
+        ob  = hue2rgb(p, q, h - 1.0 / 3.0);
+    }
+    auto byte = [](double v) {
+        return static_cast<unsigned char>(std::clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+    };
+    return DiskRgb{byte(orr), byte(og), byte(ob)};
+}
+
 } // namespace
 
 DiskArt::DiskArt() {
@@ -174,12 +226,18 @@ std::vector<std::string> DiskArt::frame_dots(double angle) const {
     return result;
 }
 
-std::vector<std::string> DiskArt::frame(double angle) const {
-    return art_.empty() ? frame_dots(angle) : frame_art(angle);
+std::vector<std::string> DiskArt::frame(double angle,
+                                        std::vector<std::vector<DiskRgb>>* out_cell_colors) const {
+    if (art_.empty()) {
+        if (out_cell_colors) out_cell_colors->clear();
+        return frame_dots(angle);
+    }
+    return frame_art(angle, out_cell_colors);
 }
 
 void DiskArt::clear_album_art() {
     art_.clear();
+    art_rgb_.clear();
 }
 
 void DiskArt::set_album_art(const AlbumArtImage& img) {
@@ -252,6 +310,24 @@ void DiskArt::set_album_art(const AlbumArtImage& img) {
     if (hi - lo < 8.0) { lo = 0.0; hi = 255.0; }
     for (double& v : lum) v = std::clamp((v - lo) / (hi - lo), 0.0, 1.0) * 255.0;
 
+    // --- the colour plane, resampled the same way --------------------
+    // Kept raw, not boosted: boosting here then averaging 8 of them per
+    // cell is not the same as averaging first and boosting once, and the
+    // second is the one that keeps a cell's colour faithful to its patch
+    // of the sleeve.
+    art_rgb_.assign(static_cast<size_t>(pw) * static_cast<size_t>(ph) * 3, 0);
+    for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+            const int sx = std::clamp(static_cast<int>((x + 0.5) / pw * img.size), 0, img.size - 1);
+            const int sy = std::clamp(static_cast<int>((y + 0.5) / ph * img.size), 0, img.size - 1);
+            const size_t src = (static_cast<size_t>(sy) * img.size + sx) * 3;
+            const size_t dst = (static_cast<size_t>(y) * pw + x) * 3;
+            art_rgb_[dst]     = img.rgb[src];
+            art_rgb_[dst + 1] = img.rgb[src + 1];
+            art_rgb_[dst + 2] = img.rgb[src + 2];
+        }
+    }
+
     // --- Floyd-Steinberg, masked to the disk -------------------------
     art_.assign(static_cast<size_t>(pw) * static_cast<size_t>(ph), 0);
     for (int y = 0; y < ph; ++y) {
@@ -275,7 +351,8 @@ void DiskArt::set_album_art(const AlbumArtImage& img) {
     }
 }
 
-std::vector<std::string> DiskArt::frame_art(double angle) const {
+std::vector<std::string> DiskArt::frame_art(double angle,
+                                            std::vector<std::vector<DiskRgb>>* colors) const {
     const int pw = width_ * 2;
     const int ph = height_ * 4;
 
@@ -291,12 +368,23 @@ std::vector<std::string> DiskArt::frame_art(double angle) const {
     const double c = std::cos(-angle);
     const double s = std::sin(-angle);
 
+    if (colors) {
+        colors->assign(height_, std::vector<DiskRgb>(width_, DiskRgb{}));
+    }
+
     std::vector<std::string> result;
     result.reserve(height_);
     for (int row = 0; row < height_; ++row) {
         std::string line;
         for (int col = 0; col < width_; ++col) {
             bool dots[4][2]{};
+            // Averaged over all 8 dot positions, not just the lit ones: a
+            // cell with two dots on still sits on a patch of sleeve, and
+            // colouring it from that whole patch is what keeps a sparse,
+            // dark region the colour it is instead of letting one stray
+            // bright dot decide for it.
+            double acc_r = 0.0, acc_g = 0.0, acc_b = 0.0;
+            int sampled = 0;
             for (int dy = 0; dy < 4; ++dy) {
                 for (int dx = 0; dx < 2; ++dx) {
                     const int x = col * 2 + dx;
@@ -306,8 +394,18 @@ std::vector<std::string> DiskArt::frame_art(double angle) const {
                     const int sx = static_cast<int>(std::lround(ox * c - oy * s + cx));
                     const int sy = static_cast<int>(std::lround(ox * s + oy * c + cy));
                     if (sx < 0 || sx >= pw || sy < 0 || sy >= ph) continue;
-                    dots[dy][dx] = art_[static_cast<size_t>(sy) * pw + sx] != 0;
+                    const size_t i = static_cast<size_t>(sy) * pw + sx;
+                    dots[dy][dx] = art_[i] != 0;
+                    if (colors) {
+                        acc_r += art_rgb_[i * 3];
+                        acc_g += art_rgb_[i * 3 + 1];
+                        acc_b += art_rgb_[i * 3 + 2];
+                        ++sampled;
+                    }
                 }
+            }
+            if (colors && sampled > 0) {
+                (*colors)[row][col] = boost_color(acc_r / sampled, acc_g / sampled, acc_b / sampled);
             }
             line += encodeBraille(dots);
         }

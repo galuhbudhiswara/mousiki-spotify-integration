@@ -3183,6 +3183,45 @@ void App::launch_row_meta_resolver() {
 // Panel builders
 // ---------------------------------------------------------------------
 
+// Paints one disk row a cell at a time from the cover's own colours.
+//
+// Two things keep this from flooding the terminal. An escape sequence is
+// only emitted when the colour actually changes from the previous cell,
+// and a blank cell doesn't change it at all -- there is nothing to paint,
+// and the mask leaves a lot of blank cells outside the circle. Covers are
+// smooth at this scale, so a row collapses to a handful of runs. Emitting
+// all 30 unconditionally would put ~10KB per frame down the pipe 30 times
+// a second, which is fine locally and visibly laggy over ssh.
+static std::string colorize_disk_row(const std::string& cells,
+                                     const std::vector<DiskRgb>& colors) {
+    // U+2800, the all-dots-off Braille cell, as UTF-8.
+    static const char kBlank[3] = {'\xe2', '\xa0', '\x80'};
+
+    std::string out;
+    out.reserve(cells.size() * 2);
+    DiskRgb last{};
+    bool have_last = false;
+    size_t cell = 0;
+    // encodeBraille() always emits exactly three bytes per cell (the
+    // U+28xx block is three bytes in UTF-8), so stepping by three walks
+    // cells without needing to decode anything.
+    for (size_t i = 0; i + 2 < cells.size() && cell < colors.size(); i += 3, ++cell) {
+        const bool blank = cells.compare(i, 3, kBlank, 3) == 0;
+        if (!blank) {
+            const DiskRgb& c = colors[cell];
+            if (!have_last || c != last) {
+                out += "\x1b[38;2;" + std::to_string(c.r) + ";" +
+                       std::to_string(c.g) + ";" + std::to_string(c.b) + "m";
+                last = c;
+                have_last = true;
+            }
+        }
+        out.append(cells, i, 3);
+    }
+    out += "\x1b[0m";
+    return out;
+}
+
 std::vector<std::string> App::build_metadata_panel(int total_width) const {
     const int inner = total_width - 4;
     const int disk_w = settings_.element_disk ? disk_.width() : 0;
@@ -3203,9 +3242,18 @@ std::vector<std::string> App::build_metadata_panel(int total_width) const {
 
     std::vector<std::string> disk_frame;
     if (settings_.element_disk) {
-        disk_frame = disk_.frame(angle_);
+        // cell_colors comes back empty unless a cover is actually on the
+        // disk, which is what makes the vinyl keep the configured
+        // gradient without a second branch down here.
+        std::vector<std::vector<DiskRgb>> cell_colors;
+        const bool want_cover_color = settings_.disk_album_art && settings_.disk_album_color;
+        disk_frame = disk_.frame(angle_, want_cover_color ? &cell_colors : nullptr);
         while (static_cast<int>(disk_frame.size()) < panel_h) disk_frame.emplace_back(std::string(disk_w, ' '));
         for (size_t row_i = 0; row_i < disk_frame.size(); ++row_i) {
+            if (row_i < cell_colors.size()) {
+                disk_frame[row_i] = colorize_disk_row(disk_frame[row_i], cell_colors[row_i]);
+                continue;
+            }
             float t = disk_frame.size() > 1 ? static_cast<float>(row_i) / static_cast<float>(disk_frame.size() - 1) : 0.0f;
             std::string disk_end = settings_.disk_color_end;
             std::string row_ansi = gradient_ansi(settings_.disk_color, disk_end, t);

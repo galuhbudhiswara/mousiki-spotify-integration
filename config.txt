@@ -90,6 +90,54 @@ ShowStatusMessages=true
 ## set to false to silence them -- they still show up in the Console overlay ('t') and the log file either way.
 
 ##-------------------------------------------
+##             SPOTIFY
+##-------------------------------------------
+
+SpotifyEnabled=false
+## master switch. mousiki doesn't decode Spotify audio -- the streams are
+## DRM'd -- so the Spotify view is a remote control and browser: you pick
+## a track and Spotify's own player (desktop/phone/speaker) renders it.
+## Separate from HKeySearchOnline ("/s:"), which is a YouTube search that
+## still plays through mousiki's own decoder.
+##
+## HKeySpotify opens the home view: Daily Mix, Jump back in, your top
+## tracks/artists, Liked Songs, your playlists, saved albums, search.
+## The visualizer and waveform render flat while Spotify owns playback --
+## both are fed from mousiki's audio callback, and Spotify's decoding
+## produces none. Local files keep all of it.
+##
+## the Daily Mix is mousiki's own, not Spotify's: Recommendations,
+## Featured Playlists, Audio Features and Spotify's algorithmic playlists
+## (Discover Weekly, Release Radar, the real Daily Mixes) closed on
+## 2024-11-27 to apps registered from that date on, which includes any
+## client id you create now. So the mix is built locally from your top
+## tracks and recently played, seeded on today's date: the same 30 tracks
+## all day, a different 30 tomorrow. Nothing is stored.
+
+SpotifyClientId=
+## blank by default -- this is yours to fill in. Your own app's Client ID
+## from https://developer.spotify.com/dashboard (free). Required for the
+## Web API backend. That dashboard entry needs this exact Redirect URI
+## added to it:
+##     http://127.0.0.1:8350/callback
+## Not a secret -- mousiki uses the OAuth PKCE flow, which has no client
+## secret. Tokens live in $HOME/.config/mousiki/spotify_token.json (mode
+## 0600) and are sent only to accounts.spotify.com.
+
+SpotifyForceWebApi=false
+## true is what the Spotify home view needs: everything in it reads the
+## account, and only the Web API backend can see the account. The local
+## backends (MPRIS on Linux, AppleScript on macOS) control the desktop app
+## and can't list playlists. Premium is required for the playback
+## controls; reading state works on a free account.
+
+SpotifyPollInterval=5000
+## how often playback state is re-read, in milliseconds. Floored at 1000,
+## and at 5000 for the Web API backend to stay inside Spotify's rate
+## limits. The progress bar interpolates between polls, so a longer
+## interval costs accuracy on seek/skip, not smoothness.
+
+##-------------------------------------------
 ##             AUTOSAVE / SESSION SNAPSHOT
 ##-------------------------------------------
 
@@ -168,6 +216,12 @@ HKeyTogglePlayPause="p"
 HKeyCyclePlayMode="m"
 HKeySearch="/"
 HKeySearchOnline="/s:"
+HKeySpotify="S"
+## uppercase S -- lowercase s is HKeySetting.
+HKeySearchSpotify="/sp:"
+## search the Spotify catalogue. Deliberately a different prefix from
+## HKeySearchOnline ("/s:") -- that one still searches YouTube and is
+## untouched by the Spotify integration.
 HKeySeekForward="ARROW_KEY_RIGHT"
 HKeySeekBackward="ARROW_KEY_LEFT"
 HKeyIncreaseVolume="1"

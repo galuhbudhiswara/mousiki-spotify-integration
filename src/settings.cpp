@@ -298,6 +298,9 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyPlay",                        "ENTER"},
             {"HKeySearch",                      "/"},
             {"HKeySearchOnline",                "/s:"},
+            // Uppercase "S" because lowercase "s" is HKeySetting.
+            {"HKeySpotify",                     "S"},
+            {"HKeySearchSpotify",               "/sp:"},
             {"HKeyPlayNextSong",                "n"},
             {"HKeyPlayPreviousSong",            "b"},
             {"HKeySeekForward",                 "ARROW_KEY_RIGHT"},
@@ -660,6 +663,18 @@ static Settings load_from_config(const fs::path& path) {
         if (key == "AutoSaveC2") { if (!unquote(value).empty()) s.autosave_c2 = normalize_color_value(unquote(value)); continue; }
 
         // --- Local music library paths ---
+        // --- Spotify integration ---------------------------------------
+        if (key == "AutoPlayOnStart" || key == "autoplay_on_start") { s.autoplay_on_start = parse_bool(value); continue; }
+        if (key == "SpotifyEnabled" || key == "spotify_enabled") { s.spotify_enabled = parse_bool(value); continue; }
+        if (key == "SpotifyClientId" || key == "spotify_client_id") { s.spotify_client_id = trim(unquote(value)); continue; }
+        if (key == "SpotifyForceWebApi" || key == "spotify_force_web_api") { s.spotify_force_web_api = parse_bool(value); continue; }
+        if (key == "SpotifyPollInterval" || key == "spotify_poll_interval") {
+            // Floored at 1000ms: anything faster is pointless for a
+            // human-visible now-playing line and just burns rate limit.
+            try { s.spotify_poll_interval_ms = std::max(1000, std::stoi(value)); } catch (...) {}
+            continue;
+        }
+
         // Each LocalMusicPath= line appends one directory.
         // A leading ~ is expanded to $HOME so users can write:
         //   LocalMusicPath=~/Music/Rock
@@ -875,9 +890,64 @@ void save_settings(const Settings& s) {
     out << "## Log file: $HOME/.cache/mousiki/logs/console.log -- wiped fresh at the start of every session.\n";
     out << "\n";
 
+    // Every key load_from_config() reads has to be written back here:
+    // this function truncates and regenerates the whole file, so anything
+    // missing is dropped on the next clean exit.
+    out << "##-------------------------------------------\n";
+    out << "##             SPOTIFY\n";
+    out << "##-------------------------------------------\n\n";
+    out << "SpotifyEnabled=" << tf(s.spotify_enabled) << "\n";
+    out << "## master switch. mousiki doesn't decode Spotify audio -- the streams are\n";
+    out << "## DRM'd -- so the Spotify view is a remote control and browser: you pick\n";
+    out << "## a track and Spotify's own player (desktop/phone/speaker) renders it.\n";
+    out << "## Separate from HKeySearchOnline (\"/s:\"), which is a YouTube search that\n";
+    out << "## still plays through mousiki's own decoder.\n";
+    out << "##\n";
+    out << "## HKeySpotify opens the home view: Daily Mix, Jump back in, your top\n";
+    out << "## tracks/artists, Liked Songs, your playlists, saved albums, search.\n";
+    out << "## The visualizer and waveform render flat while Spotify owns playback --\n";
+    out << "## both are fed from mousiki's audio callback, and Spotify's decoding\n";
+    out << "## produces none. Local files keep all of it.\n";
+    out << "##\n";
+    out << "## the Daily Mix is mousiki's own, not Spotify's: Recommendations,\n";
+    out << "## Featured Playlists, Audio Features and Spotify's algorithmic playlists\n";
+    out << "## (Discover Weekly, Release Radar, the real Daily Mixes) closed on\n";
+    out << "## 2024-11-27 to apps registered from that date on, which includes any\n";
+    out << "## client id you create now. So the mix is built locally from your top\n";
+    out << "## tracks and recently played, seeded on today's date: the same 30 tracks\n";
+    out << "## all day, a different 30 tomorrow. Nothing is stored.\n\n";
+    out << "SpotifyClientId=" << s.spotify_client_id << "\n";
+    out << "## blank by default -- this is yours to fill in. Your own app's Client ID\n";
+    out << "## from https://developer.spotify.com/dashboard (free). Required for the\n";
+    out << "## Web API backend. That dashboard entry needs this exact Redirect URI\n";
+    out << "## added to it:\n";
+    out << "##     http://127.0.0.1:8350/callback\n";
+    out << "## Not a secret -- mousiki uses the OAuth PKCE flow, which has no client\n";
+    out << "## secret. Tokens live in $HOME/.config/mousiki/spotify_token.json (mode\n";
+    out << "## 0600) and are sent only to accounts.spotify.com.\n\n";
+    out << "SpotifyForceWebApi=" << tf(s.spotify_force_web_api) << "\n";
+    out << "## true is what the Spotify home view needs: everything in it reads the\n";
+    out << "## account, and only the Web API backend can see the account. The local\n";
+    out << "## backends (MPRIS on Linux, AppleScript on macOS) control the desktop app\n";
+    out << "## and can't list playlists. Premium is required for the playback\n";
+    out << "## controls; reading state works on a free account.\n\n";
+    out << "SpotifyPollInterval=" << s.spotify_poll_interval_ms << "\n";
+    out << "## how often playback state is re-read, in milliseconds. Floored at 1000,\n";
+    out << "## and at 5000 for the Web API backend to stay inside Spotify's rate\n";
+    out << "## limits. The progress bar interpolates between polls, so a longer\n";
+    out << "## interval costs accuracy on seek/skip, not smoothness.\n";
+    out << "\n";
+
     out << "##-------------------------------------------\n";
     out << "##             AUTOSAVE / SESSION SNAPSHOT\n";
     out << "##-------------------------------------------\n\n";
+    out << "AutoPlayOnStart=" << tf(s.autoplay_on_start) << "\n";
+    out << "## false = mousiki opens silent and waits for you to pick something.\n";
+    out << "##         A restored session still comes back fully loaded -- same\n";
+    out << "##         track, position, queue, lyrics, waveform -- just paused, so\n";
+    out << "##         HKeyTogglePlayPause resumes where you left off.\n";
+    out << "## true  = starts playing on launch: the restored track, or the first\n";
+    out << "##         file in the library on a cold start.\n\n";
     out << "AutoSave=" << tf(s.autosave_enabled) << "\n## resume exact song/position/queue/repeat/shuffle next launch\n";
     out << "AutoSaveIndicator=" << tf(s.autosave_indicator) << "\n";
     out << "AutoSaveDelayInSec=" << s.autosave_delay_sec << "\n";

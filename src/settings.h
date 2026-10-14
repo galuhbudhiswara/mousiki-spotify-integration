@@ -155,6 +155,37 @@ struct Settings {
     // (~/Music and ~/disk/Music).
     std::vector<std::string> local_music_paths;
 
+    // Start playing the moment mousiki opens. Off by default: on a cold
+    // start the track would be whichever file sorted first, chosen by
+    // nobody. With this off a restored session still comes back fully
+    // loaded -- track, position, queue, lyrics, waveform -- but paused.
+    bool autoplay_on_start = false;
+
+    // --- Spotify integration (config.txt: Spotify*) ---------------------
+    // Enables the Spotify panel, now-playing and remote control. Off by
+    // default: the Web API path needs a one-time sign-in and the local
+    // path needs the Spotify desktop app.
+    bool spotify_enabled = false;
+
+    // The user's own Spotify application client ID, from
+    // https://developer.spotify.com/dashboard. Needed only by the Web API
+    // backend. Not a secret -- the PKCE flow has none -- but per-user, so
+    // there is nothing to default it to.
+    //
+    // http://127.0.0.1:8350/callback has to be registered as a Redirect
+    // URI in that dashboard entry or the sign-in is rejected.
+    std::string spotify_client_id;
+
+    // Skip the platform backend (MPRIS on Linux, AppleScript on macOS)
+    // and always use the Web API. Needed to browse playlists, since only
+    // the Web API can see the account.
+    bool spotify_force_web_api = false;
+
+    // How often to re-poll playback state, in milliseconds. The Web API
+    // backend is floored at 5000 regardless, to stay inside Spotify's
+    // rate limits.
+    int spotify_poll_interval_ms = 5000;
+
     // --- hotkey mapping ------------------------------------------------
     // Action name → key string (e.g. "ARROW_KEY_UP", "s", "ENTER")
     std::unordered_map<std::string, std::string> hotkeys;

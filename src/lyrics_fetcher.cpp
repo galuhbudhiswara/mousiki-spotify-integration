@@ -4,12 +4,15 @@
 #include "http_client.h"
 #include "tiny_json.h"
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <regex>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <zlib.h>
 
 namespace muisc {
@@ -378,6 +381,55 @@ static std::string ttml_lines_to_lrc(const std::vector<TtmlLine>& lines, bool en
     return result;
 }
 
+// --- transient failures vs "this track has no lyrics" -----------------
+// LRCLIB answers 503 ServerOverloaded for a sizeable share of requests
+// when it is busy -- measured at roughly one in three here -- and the
+// chain treated that exactly like a 404: "no lyrics found for ...", on a
+// track whose lyrics LRCLIB serves fine on the next attempt. That is the
+// come-and-go "mousiki says there are none but Spotify shows them".
+//
+// So anything retryable is retried here, and anything still failing for
+// a retryable reason is reported as an error rather than as an absence.
+
+static bool error_is_transient(const std::string& err) {
+    if (err.rfind("HTTP ", 0) == 0) {
+        int code = std::atoi(err.c_str() + 5);
+        // 408/425/429 and every 5xx are "ask again"; 401/403/404 are not.
+        return code == 408 || code == 425 || code == 429 || code >= 500;
+    }
+    // Transport-level (timeout, connection reset, DNS) -- worth another go.
+    return !err.empty();
+}
+
+static bool http_get_retry(const std::string& base_url,
+                           const std::vector<std::pair<std::string, std::string>>& params,
+                           std::string& out_body, std::string& err, int attempts = 3) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (attempt > 0) {
+            // 300ms, then 600ms. This runs on the lyrics worker thread
+            // (see App::launch_lyrics_fetch), never on the UI thread.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300 * attempt));
+        }
+        if (http_get(base_url, params, out_body, err)) return true;
+        if (!error_is_transient(err)) break; // a real "no" -- don't ask twice
+    }
+    return false;
+}
+
+// "A, B & C" -> "A". LRCLIB and Better Lyrics store one primary artist,
+// while Spotify hands over every credited artist joined with commas, and
+// that difference alone is a 404 on an exact-match lookup.
+static std::string primary_artist(const std::string& artist) {
+    size_t cut = artist.size();
+    for (const char* sep : {",", " & ", " feat. ", " ft. ", " x "}) {
+        size_t pos = artist.find(sep);
+        if (pos != std::string::npos && pos < cut) cut = pos;
+    }
+    std::string out = artist.substr(0, cut);
+    // trim_copy is defined above
+    return trim_copy(out);
+}
+
 // --- Better Lyrics / LRCLIB (native HTTP, no external process) ---------
 // Ported from scripts/lrc.py's get_better_lyrics()/get_lrclib_lyrics()/
 // get_lyrics() (now removed) -- same two APIs, same fallback order
@@ -388,7 +440,15 @@ static std::string ttml_lines_to_lrc(const std::vector<TtmlLine>& lines, bool en
 static bool try_better_lyrics(const std::string& song, const std::string& artist,
                                std::string& out_lrc, bool& out_enhanced, std::string& err) {
     std::string body;
-    bool ok = http_get("https://lyrics-api.boidu.dev/getLyrics", {{"s", song}, {"a", artist}}, body, err);
+    bool ok = http_get_retry("https://lyrics-api.boidu.dev/getLyrics", {{"s", song}, {"a", artist}}, body, err);
+    if (!ok && err == "HTTP 401") {
+        // Better Lyrics now serves only already-cached tracks without a
+        // key ("Uncached queries require a valid API key via X-API-Key"),
+        // so a track nobody has looked up through it before answers 401.
+        // Not a failure to retry, and not this track lacking lyrics
+        // either -- the chain just carries on to the next provider.
+        err = "Better Lyrics needs an API key for tracks it hasn't cached";
+    }
     ConsoleLog::instance().log_command(
         "GET https://lyrics-api.boidu.dev/getLyrics?s=" + song + "&a=" + artist,
         ok ? ("received " + std::to_string(body.size()) + " bytes") : ("failed: " + err),
@@ -537,11 +597,12 @@ static std::string krc_to_enhanced_lrc(const std::string& krc_plain) {
     return result;
 }
 
-static bool try_kugou(const std::string& song, const std::string& artist, std::string& out_lrc, std::string& err) {
+static bool try_kugou(const std::string& song, const std::string& artist, std::string& out_lrc,
+                       std::string& err) {
     std::string query = artist.empty() ? song : (artist + " " + song);
 
     std::string search_body;
-    bool ok = http_get("http://lyrics.kugou.com/search",
+    bool ok = http_get_retry("http://lyrics.kugou.com/search",
                         {{"ver", "1"}, {"man", "yes"}, {"client", "pc"}, {"keyword", query}},
                         search_body, err);
     ConsoleLog::instance().log_command(
@@ -571,7 +632,7 @@ static bool try_kugou(const std::string& song, const std::string& artist, std::s
     }
 
     std::string dl_body;
-    ok = http_get("http://lyrics.kugou.com/download",
+    ok = http_get_retry("http://lyrics.kugou.com/download",
                    {{"ver", "1"}, {"client", "pc"}, {"id", lyric_id}, {"accesskey", access_key},
                     {"fmt", "krc"}, {"charset", "utf8"}},
                    dl_body, err);
@@ -606,9 +667,10 @@ static bool try_kugou(const std::string& song, const std::string& artist, std::s
     return true;
 }
 
-static bool try_lrclib(const std::string& song, const std::string& artist, std::string& out_lrc, std::string& err) {
+static bool try_lrclib(const std::string& song, const std::string& artist, std::string& out_lrc,
+                        std::string& err) {
     std::string body;
-    bool ok = http_get("https://lrclib.net/api/get", {{"track_name", song}, {"artist_name", artist}}, body, err);
+    bool ok = http_get_retry("https://lrclib.net/api/get", {{"track_name", song}, {"artist_name", artist}}, body, err);
     ConsoleLog::instance().log_command(
         "GET https://lrclib.net/api/get?track_name=" + song + "&artist_name=" + artist,
         ok ? ("received " + std::to_string(body.size()) + " bytes") : ("failed: " + err),
@@ -621,6 +683,53 @@ static bool try_lrclib(const std::string& song, const std::string& artist, std::
     }
     out_lrc = synced;
     return true;
+}
+
+// LRCLIB's /api/get is an exact match on (track, artist), so a track that
+// it does have still 404s whenever the strings differ at all -- Spotify's
+// "A, B & C" against LRCLIB's "A", a title carrying " - Remastered 2011",
+// a stray "(Official Video)". /api/search is fuzzy, so it is what gets
+// asked once the exact lookups have all missed.
+// `answered` comes back true whenever LRCLIB actually answered -- a hit,
+// or a clean "nothing matching" -- and false only when it never got round
+// to saying (503 while busy, a timeout). That is the one signal worth
+// trusting for "this track genuinely has no lyrics anywhere": Better
+// Lyrics' 401 and KuGou's empty candidate list say nothing either way.
+static bool try_lrclib_search(const std::string& song, const std::string& artist,
+                               std::string& out_lrc, std::string& err, bool& answered) {
+    std::vector<std::pair<std::string, std::string>> params{{"track_name", song}};
+    if (!artist.empty()) params.push_back({"artist_name", primary_artist(artist)});
+
+    std::string body;
+    bool ok = http_get_retry("https://lrclib.net/api/search", params, body, err);
+    ConsoleLog::instance().log_command(
+        "GET https://lrclib.net/api/search?track_name=" + song +
+            (artist.empty() ? "" : "&artist_name=" + primary_artist(artist)),
+        ok ? ("received " + std::to_string(body.size()) + " bytes") : ("failed: " + err),
+        ok ? 0 : 1);
+    if (!ok) {
+        answered = !error_is_transient(err);
+        return false;
+    }
+    answered = true;
+
+    tinyjson::Value root;
+    if (!tinyjson::parse(body, root) || root.type != tinyjson::Type::Array) {
+        err = "LRCLIB: malformed search response";
+        return false;
+    }
+    // LRCLIB ranks its own results, so the first hit that actually
+    // carries synchronized lyrics is the answer -- plenty of entries are
+    // plain-text only, and those are no use to a scrolling lyrics panel.
+    for (const auto& item : root.arr) {
+        if (item.type != tinyjson::Type::Object) continue;
+        const tinyjson::Value* synced = item.find("syncedLyrics");
+        if (!synced || synced->type != tinyjson::Type::String || synced->str.empty()) continue;
+        out_lrc = synced->str;
+        return true;
+    }
+    err = "LRCLIB search found nothing synchronized";
+    return false;
 }
 
 static bool fetch_from_apis(const std::string& song, const std::string& artist,
@@ -745,27 +854,84 @@ LyricsResult fetch_synced_lyrics(const std::string& title, const std::string& ar
     //    script (scripts/fetch_lyrics.py / scripts/lrc.py, now removed)
     //    that did the same two calls with the `requests` package.
     std::string clean_title = clean_youtube_title(title);
-    std::string lrc, source;
-    bool enhanced = false;
-    bool ok = fetch_from_apis(clean_title, artist, lrc, enhanced, source);
 
+    // The (title, artist) pairs to try, in order. clean_youtube_title()
+    // exists for uploader-written video titles, and on Spotify's own
+    // metadata it can do damage instead: "Garam & Madu (Sakit Dadaku)"
+    // loses the half the catalogue actually indexes it under. So the
+    // untouched title is tried too, and the first credited artist alone
+    // after that -- the providers store one artist where Spotify sends
+    // all of them.
+    std::vector<std::pair<std::string, std::string>> variants;
+    auto add_variant = [&variants](std::string t, std::string a) {
+        if (t.empty()) return;
+        for (const auto& v : variants) {
+            if (v.first == t && v.second == a) return;
+        }
+        variants.emplace_back(std::move(t), std::move(a));
+    };
+    add_variant(clean_title, artist);
+    add_variant(title, artist);
+    add_variant(clean_title, primary_artist(artist));
     // Same swapped-title/artist retry the old script did: a YouTube
     // video title like "Artist - Title" with no separate artist field
     // often resolves better as (title=Title, artist=Artist).
-    if (!ok && artist.empty()) {
+    if (artist.empty()) {
         size_t dash = clean_title.find('-');
         if (dash != std::string::npos) {
             std::string part0 = trim_copy(clean_title.substr(0, dash));
             std::string part1 = trim_copy(clean_title.substr(dash + 1));
-            if (!part0.empty() && !part1.empty()) {
-                ok = fetch_from_apis(part1, part0, lrc, enhanced, source);
-            }
+            if (!part0.empty() && !part1.empty()) add_variant(part1, part0);
+        }
+    }
+
+    std::string lrc, source;
+    bool enhanced = false;
+    bool ok = false;
+    for (std::size_t i = 0; i < variants.size() && !ok; ++i) {
+        const auto& v = variants[i];
+        if (i == 0) {
+            ok = fetch_from_apis(v.first, v.second, lrc, enhanced, source);
+            continue;
+        }
+        // The extra variants exist for the exact-match lookup
+        // specifically, so only LRCLIB is asked again: Better Lyrics
+        // answers the same for every spelling of a track it has not
+        // cached, and KuGou searches on one keyword string that is
+        // already fuzzy. Asking all three per variant would be a dozen
+        // requests to establish one absence.
+        std::string err;
+        if (try_lrclib(v.first, v.second, lrc, err)) {
+            enhanced = false;
+            source = "lrclib";
+            ok = true;
+        }
+    }
+
+    // Exact lookups all missed -- ask LRCLIB to match loosely before
+    // declaring the track lyric-less.
+    bool lrclib_answered = false; // false = LRCLIB never got round to saying
+    if (!ok) {
+        std::string search_err;
+        if (try_lrclib_search(clean_title, artist, lrc, search_err, lrclib_answered)) {
+            enhanced = false;
+            source = "lrclib";
+            ok = true;
         }
     }
 
     if (!ok) {
-        result.status = LyricsStatus::NotFound;
-        result.message = "no lyrics found for \"" + title + "\"";
+        // A busy provider is not an absent lyric. Saying "none found"
+        // for a 503 is what made lyrics look missing for tracks that
+        // have them, so the two get different statuses and different
+        // words -- and Error is what App retries on its own.
+        if (!lrclib_answered) {
+            result.status = LyricsStatus::Error;
+            result.message = "lyrics server busy -- retrying";
+        } else {
+            result.status = LyricsStatus::NotFound;
+            result.message = "no lyrics found for \"" + title + "\"";
+        }
         return result;
     }
 

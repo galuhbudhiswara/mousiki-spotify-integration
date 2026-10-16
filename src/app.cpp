@@ -732,6 +732,12 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
 // stall: whenever lyrics aren't quickly available (still mid network-call
 // chain) and the user skips to another track before it resolves,
 // switching songs would hang until the abandoned fetch finished.
+// A busy provider is retried from here, spaced out: fetch_synced_lyrics()
+// already retries each request a few hundred milliseconds apart, so
+// these are the slower "come back to it" attempts.
+static constexpr int kLyricsBusyRetries = 3;
+static constexpr int kLyricsBusyRetryMs = 5000;
+
 // Detaching instead, with an epoch guard so a late-arriving stale result
 // just gets discarded rather than clobbering the new/retried track's
 // lyrics. Shared by the initial per-track fetch (poll_pending_load) and
@@ -741,6 +747,25 @@ void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path pa
     int my_epoch = ++lyrics_epoch_;
     std::thread([this, title, artist, path, force_network, my_epoch]() {
         LyricsResult r = fetch_synced_lyrics(title, artist, path, force_network);
+
+        // LyricsStatus::Error means no provider ever actually answered --
+        // LRCLIB is busy (it serves 503 ServerOverloaded a good fraction
+        // of the time), the connection dropped. That is not this track
+        // being lyric-less, and the same request a few seconds later
+        // usually lands, so come back to it rather than leaving the panel
+        // claiming there are none. NotFound gets no retry: that is a real
+        // answer. Slept in slices so changing track ends it immediately.
+        for (int attempt = 0; r.status == LyricsStatus::Error && attempt < kLyricsBusyRetries; ++attempt) {
+            for (int slept = 0; slept < kLyricsBusyRetryMs; slept += 100) {
+                if (my_epoch != lyrics_epoch_.load()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            r = fetch_synced_lyrics(title, artist, path, force_network);
+        }
+        if (r.status == LyricsStatus::Error) {
+            r.message = "lyrics server busy -- press l to try again";
+        }
+
         std::lock_guard<std::mutex> lock(lyrics_mutex_);
         if (my_epoch != lyrics_epoch_.load()) return; // a newer/retried fetch has since started — discard
         lyrics_result_ = std::move(r);

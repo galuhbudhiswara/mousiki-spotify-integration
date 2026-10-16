@@ -95,6 +95,11 @@ bool SpotifyClient::play_uri(const std::string&, std::string* error_out, std::st
     return false;
 }
 
+bool SpotifyClient::play_uris(const std::vector<std::string>&, int, std::string* error_out,
+                              std::string*) {
+    return unsupported(backend_name(), "start a list of tracks", error_out);
+}
+
 // ---------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------

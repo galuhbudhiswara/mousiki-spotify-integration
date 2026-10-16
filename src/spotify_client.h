@@ -230,6 +230,23 @@ public:
     // it may well be a different machine.
     virtual bool play_uri(const std::string& uri, std::string* error_out = nullptr,
                           std::string* device_used_out = nullptr);
+
+    // Starts playback of a whole list of track uris at once, beginning at
+    // `offset_index`. Everything after it becomes the up-next queue.
+    //
+    // This is how a queue gets *replaced* rather than grown. Spotify has
+    // no "clear the queue" endpoint -- POST /me/player/queue only ever
+    // appends, so building a continuation with it left the previous one
+    // in place and the queue grew with every track started. Handing the
+    // whole list to the play endpoint instead makes each start define the
+    // queue outright, which is also what Spotify's own clients do when
+    // you pick a song: what follows it is that context, not the leftovers
+    // of the last one.
+    //
+    // Spotify caps the list at 100 uris. Web API only.
+    virtual bool play_uris(const std::vector<std::string>& uris, int offset_index = 0,
+                           std::string* error_out = nullptr,
+                           std::string* device_used_out = nullptr);
 };
 
 // ---------------------------------------------------------------------

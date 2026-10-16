@@ -492,6 +492,42 @@ private:
     void set_disk_album_art(const std::string& url, const std::string& cache_key);
     void poll_pending_album_art();
 
+    // --- Spotify auto-mix pool ------------------------------------------
+    // What the continuation after a chosen track is drawn from: the
+    // account's own top tracks and recently played (the same pool the
+    // home screen's Daily Mix uses). Fetched once in the background and
+    // kept, because the continuation has to be computable the instant a
+    // track is started -- the whole list goes out with the play command
+    // that starts it, and three catalogue requests in that path would be
+    // three requests' worth of silence.
+    std::mutex spotify_mix_mutex_;
+    std::vector<SpotifyTrack> spotify_mix_top_recent_;   // top tracks, ~4 weeks
+    std::vector<SpotifyTrack> spotify_mix_top_all_time_; // top tracks, years
+    std::vector<SpotifyTrack> spotify_mix_recently_played_;
+    std::atomic<bool> spotify_mix_pool_ready_{false};
+    std::atomic<bool> spotify_mix_pool_loading_{false};
+
+    std::atomic<int> spotify_mix_pool_attempts_{0};
+
+    // Fills that pool in the background, one fetch at a time and a
+    // bounded number of times. No-op once it is loaded.
+    void warm_spotify_mix_pool();
+
+    // Installs a freshly fetched pool, from wherever it was fetched.
+    void store_spotify_mix_pool(std::vector<SpotifyTrack> top_recent,
+                                std::vector<SpotifyTrack> top_all_time,
+                                std::vector<SpotifyTrack> recently_played);
+
+    // `size` tracks to play after `seed_uri`, drawn from the pool and
+    // shuffled deterministically for `seed`. Empty when the pool isn't
+    // loaded yet.
+    std::vector<std::string> spotify_continuation_uris(const std::string& seed_uri,
+                                                       int seed, int size);
+
+    // The current up-next queue from `uri` onwards, `uri` first, as a
+    // play-command uri list. False when `uri` isn't in the queue at all.
+    bool spotify_queue_from(const std::string& uri, std::vector<std::string>& out_uris) const;
+
     // --- Spotify now-playing poll ---------------------------------------
     // A heartbeat for as long as the Spotify view/playback is active,
     // sleeping settings_.spotify_poll_interval_ms between reads. Its own

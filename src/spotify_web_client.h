@@ -42,6 +42,9 @@ public:
     bool devices(std::vector<SpotifyDevice>& out, std::string* error_out = nullptr) override;
     bool play_uri(const std::string& uri, std::string* error_out = nullptr,
                   std::string* device_used_out = nullptr) override;
+    bool play_uris(const std::vector<std::string>& uris, int offset_index = 0,
+                   std::string* error_out = nullptr,
+                   std::string* device_used_out = nullptr) override;
 
     bool search_tracks(const std::string& query, int limit,
                        std::vector<SpotifyTrack>& out, std::string* error_out = nullptr) override;
@@ -60,6 +63,14 @@ public:
                            std::string* error_out = nullptr) override;
 
 private:
+    // PUT /me/player/play with an already-built body, including the
+    // "no active device" recovery both play_uri() and play_uris() need:
+    // a device-less play command goes to the active device, and an open
+    // but idle Spotify client is not active -- which is how a terminal
+    // remote control finds the account most of the time.
+    bool start_playback(const std::string& json, std::string* error_out,
+                        std::string* device_used_out);
+
     static constexpr const char* kApiBase = "https://api.spotify.com/v1/";
     // Hard ceiling imposed by Spotify's February 2026 revision, which cut
     // the search limit maximum from 50 to 10. Exceeding it is a 400, not

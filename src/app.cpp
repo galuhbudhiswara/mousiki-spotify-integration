@@ -945,7 +945,13 @@ bool App::ensure_spotify_client() {
         spotify_unavailable_reason_ =
             std::string("the ") + spotify_->backend_name() +
             " backend can't browse your library -- set SpotifyForceWebApi=true in config.txt";
+        return true;
     }
+    // Load the auto-mix pool now, in the background, so the first track
+    // started already has a continuation to send with it (see
+    // spotify_continuation_uris). Runs once: this function builds the
+    // client exactly once per session.
+    warm_spotify_mix_pool();
     return true;
 }
 
@@ -1279,6 +1285,94 @@ void App::yield_playback_to_spotify() {
     fft_.reset();       // stop the previous track's spectrum tail from lingering
 }
 
+// --- Spotify auto-mix pool --------------------------------------------
+// An account that answers nothing here -- no listening history, or a
+// backend without the scopes -- must not be asked again on every single
+// play, so the attempts run out.
+static constexpr int kSpotifyMixPoolAttempts = 3;
+
+void App::store_spotify_mix_pool(std::vector<SpotifyTrack> top_recent,
+                                 std::vector<SpotifyTrack> top_all_time,
+                                 std::vector<SpotifyTrack> recently_played) {
+    const bool any = !top_recent.empty() || !top_all_time.empty() || !recently_played.empty();
+    {
+        std::lock_guard<std::mutex> lk(spotify_mix_mutex_);
+        spotify_mix_top_recent_ = std::move(top_recent);
+        spotify_mix_top_all_time_ = std::move(top_all_time);
+        spotify_mix_recently_played_ = std::move(recently_played);
+    }
+    if (any) spotify_mix_pool_ready_ = true;
+}
+
+void App::warm_spotify_mix_pool() {
+    if (spotify_mix_pool_ready_.load()) return;
+    if (spotify_mix_pool_loading_.exchange(true)) return; // one fetch in flight at a time
+    if (spotify_mix_pool_attempts_.fetch_add(1) >= kSpotifyMixPoolAttempts ||
+        !spotify_ || !spotify_->supports_library()) {
+        spotify_mix_pool_loading_ = false;
+        return;
+    }
+
+    auto client = spotify_;
+    // Its own thread rather than the command worker: that queue is FIFO,
+    // and three catalogue requests sitting in front of the next transport
+    // command would make pressing play feel stuck.
+    std::thread([this, client]() {
+        std::vector<SpotifyTrack> top_recent, top_all_time, recent;
+        std::string ignored;
+        client->top_tracks("short_term", 50, top_recent, &ignored);
+        client->top_tracks("long_term", 50, top_all_time, &ignored);
+        client->recently_played(50, recent, &ignored);
+        store_spotify_mix_pool(std::move(top_recent), std::move(top_all_time), std::move(recent));
+        spotify_mix_pool_loading_ = false;
+    }).detach();
+}
+
+std::vector<std::string> App::spotify_continuation_uris(const std::string& seed_uri,
+                                                        int seed, int size) {
+    if (size <= 0 || seed_uri.empty() || !spotify_mix_pool_ready_.load()) return {};
+
+    std::vector<DailyMixSource> sources;
+    {
+        std::lock_guard<std::mutex> lk(spotify_mix_mutex_);
+        // Same weighting the home screen's Daily Mix uses: what the
+        // listener is on right now ahead of all-time favourites, and the
+        // last session's tracks behind both.
+        if (!spotify_mix_top_recent_.empty())      sources.push_back({spotify_mix_top_recent_, 5});
+        if (!spotify_mix_top_all_time_.empty())    sources.push_back({spotify_mix_top_all_time_, 3});
+        if (!spotify_mix_recently_played_.empty()) sources.push_back({spotify_mix_recently_played_, 2});
+    }
+    if (sources.empty()) return {};
+
+    // One extra, because the seed track is very likely in the pool itself
+    // (it was probably picked from exactly these lists) and gets dropped.
+    std::vector<SpotifyTrack> mix =
+        build_daily_mix(sources, seed, static_cast<std::size_t>(size) + 1);
+
+    std::vector<std::string> uris{seed_uri};
+    for (const auto& m : mix) {
+        if (static_cast<int>(uris.size()) > size) break; // seed + size
+        if (m.uri.empty() || m.uri == seed_uri) continue;
+        uris.push_back(m.uri);
+    }
+    return uris.size() > 1 ? uris : std::vector<std::string>{};
+}
+
+bool App::spotify_queue_from(const std::string& uri, std::vector<std::string>& out_uris) const {
+    out_uris.clear();
+    if (uri.empty()) return false;
+    auto it = std::find_if(spotify_queue_.begin(), spotify_queue_.end(),
+                           [&uri](const SpotifyTrack& q) { return q.uri == uri; });
+    if (it == spotify_queue_.end()) return false;
+    // The picked track first, then everything that was behind it. What
+    // was ahead of it drops off, which is what picking a row out of
+    // "Next in queue" does in Spotify's own clients.
+    for (; it != spotify_queue_.end(); ++it) {
+        if (!it->uri.empty()) out_uris.push_back(it->uri);
+    }
+    return !out_uris.empty();
+}
+
 void App::spotify_play_track(const SpotifyTrack& t) {
     if (!ensure_spotify_client()) { status_line_ = spotify_unavailable_reason_; return; }
 
@@ -1355,9 +1449,38 @@ void App::spotify_play_track(const SpotifyTrack& t) {
     // it survives a restart.
     const int mix_seed = spotify_daily_seed() ^ static_cast<int>(std::hash<std::string>{}(t.uri));
 
-    spotify_run_command([this, client, uri, label, auto_mix, mix_size, mix_seed]() {
+    // Spotify's own shuffle semantics, which is what was asked for:
+    //
+    //   - a track that is already in the up-next queue continues that
+    //     queue from it, the way clicking a row in Spotify's "Next in
+    //     queue" does (and, like there, the rows above it drop off);
+    //   - anything else starts a new continuation, re-randomised, and
+    //     that continuation REPLACES the queue.
+    //
+    // Both go out as a single play command carrying the whole uri list,
+    // which is the only way to replace a queue: POST /me/player/queue
+    // can only append, so the previous continuation used to survive
+    // every new pick and the queue grew by ten tracks per song started.
+    std::vector<std::string> play_list;
+    bool continuing_queue = false;
+    if (spotify_queue_from(uri, play_list)) {
+        continuing_queue = true;
+    } else if (auto_mix) {
+        play_list = spotify_continuation_uris(uri, mix_seed, mix_size);
+    }
+    // Pool not loaded yet (the first play of a session, before the warm
+    // started at sign-in has landed) -- fall back to starting the one
+    // track and appending a continuation behind it. That path keeps the
+    // pool it fetches, so the next pick replaces the queue properly.
+    const bool append_fallback = !continuing_queue && auto_mix && play_list.empty();
+
+    spotify_run_command([this, client, uri, label, mix_size, mix_seed,
+                         play_list, continuing_queue, append_fallback]() {
         std::string err, device;
-        if (!client->play_uri(uri, &err, &device)) {
+        const bool started = play_list.empty()
+            ? client->play_uri(uri, &err, &device)
+            : client->play_uris(play_list, 0, &err, &device);
+        if (!started) {
             spotify_post_message(err.empty() ? "spotify refused to play that" : err);
             return;
         }
@@ -1365,13 +1488,27 @@ void App::spotify_play_track(const SpotifyTrack& t) {
         // file: play_uri() may have had to wake an idle client, and that
         // client can be a different machine. "Nothing happened" and
         // "it's playing in the other room" look identical from here.
-        spotify_post_message(device.empty() ? "playing on spotify: " + label
-                                            : "playing on " + device + ": " + label);
-        if (!auto_mix) return;
+        //
+        // One message rather than two: only the newest reaches the status
+        // line, and both halves matter -- where it is playing, and what
+        // it is going to play next.
+        std::string note = device.empty() ? "playing on spotify: " + label
+                                          : "playing on " + device + ": " + label;
+        if (continuing_queue) {
+            note += " -- continuing the queue, " +
+                    std::to_string(play_list.size() - 1) + " up next";
+        } else if (!play_list.empty()) {
+            note += " -- auto-mix: " + std::to_string(play_list.size() - 1) + " up next";
+        }
+        spotify_post_message(note);
+        if (!append_fallback) return;
 
         // Everything below runs AFTER playback has started, on the worker
         // -- the track is already audible, and the queue fills in behind
-        // it. Nothing here can delay the music.
+        // it. Nothing here can delay the music. It is only reached with a
+        // cold mix pool, where there was no list to hand the play command
+        // -- so it also keeps what it fetches, and the next pick takes
+        // the replace-the-queue path above instead of this one.
         //
         // Not Spotify's radio: /v1/recommendations is closed to apps
         // registered after 2024-11-27, so there is no "more like this
@@ -1379,13 +1516,17 @@ void App::spotify_play_track(const SpotifyTrack& t) {
         // instead, the same pool the home screen's Daily Mix uses.
         std::vector<SpotifyTrack> now_favs, all_time, recent;
         std::string ignored;
+        client->top_tracks("short_term", 50, now_favs, &ignored);
+        client->top_tracks("long_term", 50, all_time, &ignored);
+        client->recently_played(50, recent, &ignored);
+
         std::vector<DailyMixSource> sources;
-        if (client->top_tracks("short_term", 50, now_favs, &ignored) && !now_favs.empty())
-            sources.push_back({std::move(now_favs), 5});
-        if (client->top_tracks("long_term", 50, all_time, &ignored) && !all_time.empty())
-            sources.push_back({std::move(all_time), 3});
-        if (client->recently_played(50, recent, &ignored) && !recent.empty())
-            sources.push_back({std::move(recent), 2});
+        if (!now_favs.empty())  sources.push_back({now_favs, 5});
+        if (!all_time.empty())  sources.push_back({all_time, 3});
+        if (!recent.empty())    sources.push_back({recent, 2});
+        // Kept, so the next pick needs none of these three requests and
+        // can hand its whole continuation to the play command.
+        store_spotify_mix_pool(std::move(now_favs), std::move(all_time), std::move(recent));
         if (sources.empty()) return; // nothing to mix from; the track still plays
 
         // One extra, because the seed track is very likely in the pool

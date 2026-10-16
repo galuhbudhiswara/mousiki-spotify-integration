@@ -337,7 +337,32 @@ bool SpotifyWebClient::play_uri(const std::string& uri, std::string* error_out,
     } else {
         json = "{\"context_uri\":\"" + tinyjson::escape(uri) + "\"}";
     }
+    return start_playback(json, error_out, device_used_out);
+}
 
+bool SpotifyWebClient::play_uris(const std::vector<std::string>& uris, int offset_index,
+                                 std::string* error_out, std::string* device_used_out) {
+    if (uris.empty()) {
+        if (error_out) *error_out = "no tracks to play";
+        return false;
+    }
+    // Spotify rejects a list longer than 100 outright rather than
+    // truncating it, and an offset outside the list is a 400 too.
+    const std::size_t kMaxUris = 100;
+    const std::size_t count = std::min(uris.size(), kMaxUris);
+    const int offset = std::clamp(offset_index, 0, static_cast<int>(count) - 1);
+
+    std::string json = "{\"uris\":[";
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i) json += ",";
+        json += "\"" + tinyjson::escape(uris[i]) + "\"";
+    }
+    json += "],\"offset\":{\"position\":" + std::to_string(offset) + "}}";
+    return start_playback(json, error_out, device_used_out);
+}
+
+bool SpotifyWebClient::start_playback(const std::string& json, std::string* error_out,
+                                      std::string* device_used_out) {
     std::string body;
     std::string first_err;
     if (request_with_refresh("PUT", "me/player/play", json, body, &first_err)) return true;

@@ -216,6 +216,11 @@ struct Settings {
     // same pool the home screen's Daily Mix uses -- the listener's own
     // top tracks and recently played -- so it is reliably music they
     // like, but it is not related to the track they picked.
+    //
+    // The continuation replaces the queue rather than being appended to
+    // it, and a track that is already in the queue continues that queue
+    // instead of getting a new continuation at all -- see
+    // App::spotify_play_track().
     bool spotify_auto_mix = true;
     int spotify_auto_mix_size = 10;
 
